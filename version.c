@@ -300,12 +300,178 @@ static int  AlreadyLoaded(const char* fullPath);
 static void RecordLoaded(const char* fullPath);
 static int  g_loadedCount;
 
-static volatile int g_modsLoaded = 0;
+static volatile LONG g_modsLoaded = 0;
+static void LoadModsOnce(void);   /* forward decl for entry-point fallback */
+
+/* --- Entry-point trampoline fallback ---
+ *
+ * PURELY A SAFETY NET.  On most builds, a version.dll proxy call fires
+ * early and triggers LoadModsOnce() long before the CRT entry point
+ * runs.  This fallback exists for the rare case where NO proxy export
+ * is ever called (some builds never hit a version.dll export).
+ *
+ * Strategy: during DLL_PROCESS_ATTACH we patch the game's PE entry
+ * point (AddressOfEntryPoint, i.e. mainCRTStartup) with a small
+ * trampoline that calls a handler, then jumps back to the *original*
+ * entry point.  The handler calls LoadModsOnce(), then restores the
+ * original entry-point bytes before returning.  This way the
+ * trampoline never executes stolen prologue bytes at a relocated
+ * address, avoiding RIP-relative fixup issues entirely.
+ *
+ * Because the entry point has not been called yet at DllMain time,
+ * and the trampoline only executes once the loader lock is fully
+ * released, this avoids the deadlock issues that plague
+ * CreateThread-based fallbacks.
+ *
+ * If a proxy call already loaded mods, the InterlockedCompareExchange
+ * guard in LoadModsOnce() makes the handler a near-no-op (it still
+ * restores the entry-point bytes, which is harmless).
+ *
+ * TODO: The restore-and-jump approach avoids the RIP-relative problem
+ * entirely but means we can't chain hooks on the entry point.  A more
+ * complete fix would be to detect RIP-relative operands in the stolen
+ * bytes and rewrite their displacements in the trampoline, matching
+ * the approach MJ_CreateSite already uses for E8/E9 instructions.
+ *
+ * The trampoline layout (x86-64):
+ *
+ *   sub  rsp, 0x28                     ; shadow space + alignment
+ *   mov  rax, <EntryPointHandler>      ; absolute 64-bit address
+ *   call rax                           ; load mods + restore bytes
+ *   add  rsp, 0x28
+ *   jmp  [rip+0]                       ; jump to restored entry point
+ *   <8-byte entry point address>
+ */
+
+/* Saved state for restoring the entry point after the trampoline fires */
+static uint8_t* g_epFallbackAddr       = NULL;
+static uint8_t  g_epFallbackOrigBytes[24];
+static int      g_epFallbackStolenCount = 0;
+
+static void EntryPointHandler(void)
+{
+    LoadModsOnce();
+
+    /* Restore the original entry-point bytes so the jmp back executes
+     * the real prologue in place -- no RIP-relative relocation needed. */
+    if (g_epFallbackAddr && g_epFallbackStolenCount > 0) {
+        DWORD oldProt;
+        VirtualProtect(g_epFallbackAddr, g_epFallbackStolenCount,
+                       PAGE_EXECUTE_READWRITE, &oldProt);
+        memcpy(g_epFallbackAddr, g_epFallbackOrigBytes,
+               g_epFallbackStolenCount);
+        VirtualProtect(g_epFallbackAddr, g_epFallbackStolenCount,
+                       oldProt, &oldProt);
+    }
+}
+
+static int PatchEntryPointFallback(void)
+{
+    /* Locate the game's PE entry point */
+    UINT_PTR imageBase = (UINT_PTR)GetModuleHandleA(NULL);
+    if (!imageBase) return 0;
+
+    const uint8_t* dosHeader = (const uint8_t*)imageBase;
+    DWORD peOffset = *(const DWORD*)(dosHeader + 0x3C);
+    const uint8_t* peHeader = dosHeader + peOffset;
+
+    /* Skip PE signature (4) + COFF header (20) to reach OptionalHeader */
+    const uint8_t* optHeader = peHeader + 4 + 20;
+    WORD optMagic = *(const WORD*)optHeader;
+    if (optMagic != 0x20B) {
+        CLog("  Fallback: not PE32+ (magic 0x%04X), skipping.", optMagic);
+        return 0;
+    }
+
+    DWORD entryRVA = *(const DWORD*)(optHeader + 16);  /* AddressOfEntryPoint */
+    if (entryRVA == 0) {
+        CLog("  Fallback: no entry point, skipping.");
+        return 0;
+    }
+
+    uint8_t* entryAddr = (uint8_t*)(imageBase + entryRVA);
+
+    /* Walk instructions at the entry point to find a clean cut >= 14 bytes */
+    int stolenBytes = 0;
+    const uint8_t* walk = entryAddr;
+    while (stolenBytes < 14) {
+        int len = mj_lde(walk);
+        if (len == 0) {
+            CLog("  Fallback: LDE failed at entry+%d, cannot patch.", stolenBytes);
+            return 0;
+        }
+        walk        += len;
+        stolenBytes += len;
+    }
+
+    /* Save the original bytes so EntryPointHandler can restore them */
+    g_epFallbackAddr        = entryAddr;
+    g_epFallbackStolenCount = stolenBytes;
+    memcpy(g_epFallbackOrigBytes, entryAddr, stolenBytes);
+
+    /* Trampoline: 20 (call wrapper) + 14 (jmp to entry start)
+     * No stolen bytes -- the handler restores them before we jump back. */
+    int tramSize = 20 + 14;
+    uint8_t* tramp = (uint8_t*)VirtualAlloc(NULL, tramSize,
+                                             MEM_COMMIT | MEM_RESERVE,
+                                             PAGE_EXECUTE_READWRITE);
+    if (!tramp) {
+        CLog("  Fallback: VirtualAlloc failed, cannot patch.");
+        g_epFallbackAddr = NULL;
+        return 0;
+    }
+
+    int off = 0;
+
+    /* sub rsp, 0x28 */
+    tramp[off++] = 0x48; tramp[off++] = 0x83;
+    tramp[off++] = 0xEC; tramp[off++] = 0x28;
+
+    /* mov rax, <EntryPointHandler> */
+    tramp[off++] = 0x48; tramp[off++] = 0xB8;
+    UINT_PTR fnAddr = (UINT_PTR)&EntryPointHandler;
+    memcpy(tramp + off, &fnAddr, 8);
+    off += 8;
+
+    /* call rax */
+    tramp[off++] = 0xFF; tramp[off++] = 0xD0;
+
+    /* add rsp, 0x28 */
+    tramp[off++] = 0x48; tramp[off++] = 0x83;
+    tramp[off++] = 0xC4; tramp[off++] = 0x28;
+
+    /* jmp [rip+0] back to entry point start (now restored to original) */
+    tramp[off++] = 0xFF; tramp[off++] = 0x25;
+    tramp[off++] = 0x00; tramp[off++] = 0x00;
+    tramp[off++] = 0x00; tramp[off++] = 0x00;
+    UINT_PTR retAddr = (UINT_PTR)entryAddr;  /* start, not +stolenBytes */
+    memcpy(tramp + off, &retAddr, 8);
+
+    /* Overwrite the entry point: jmp [rip+0] to trampoline, NOP remainder */
+    DWORD oldProt;
+    VirtualProtect(entryAddr, stolenBytes, PAGE_EXECUTE_READWRITE, &oldProt);
+
+    entryAddr[0] = 0xFF;
+    entryAddr[1] = 0x25;
+    entryAddr[2] = 0x00;
+    entryAddr[3] = 0x00;
+    entryAddr[4] = 0x00;
+    entryAddr[5] = 0x00;
+    memcpy(entryAddr + 6, &tramp, 8);
+    for (int i = 14; i < stolenBytes; i++)
+        entryAddr[i] = 0x90;
+
+    VirtualProtect(entryAddr, stolenBytes, oldProt, &oldProt);
+
+    CLog("  Fallback: entry point patched at RVA 0x%X (%d stolen bytes).",
+         entryRVA, stolenBytes);
+
+    return 1;
+}
 
 static void LoadModsOnce(void)
 {
-    if (g_modsLoaded) return;
-    g_modsLoaded = 1;
+    if (InterlockedCompareExchange(&g_modsLoaded, 1, 0) != 0) return;
 
     /* Actually disable when Enabled=0 says we're disabled. */
     if (!g_config.enabled) return;
@@ -422,6 +588,7 @@ static void LoadModsOnce(void)
  *  The .def file maps the real export names to these Proxy_ functions.
  *  Every stub calls LoadModsOnce() to trigger deferred mod loading
  *  on the first call.
+ *
  * =================================================================== */
 
 __declspec(dllexport) BOOL WINAPI Proxy_GetFileVersionInfoA(
@@ -848,6 +1015,69 @@ static MJ_HookSite* MJ_FindSite(UINT_PTR rva)
     return NULL;
 }
 
+/* --- Internal: allocate RWX memory within +/-2 GB of 'nearAddr' ---
+ *
+ * Trampolines that contain E8/E9 rel32 instructions need to sit close
+ * enough to the original code that the 32-bit displacement can still
+ * reach the same target.  Scans outward from 'nearAddr' in 64 KB
+ * steps (Windows allocation granularity) looking for a free region.
+ * Falls back to an unconstrained allocation if nothing in range is
+ * found; the fixup pass will log a warning in that case. */
+
+static BYTE* MJ_AllocNear(void* nearAddr, SIZE_T size)
+{
+    const SIZE_T kGranularity = 0x10000;          /* 64 KB */
+    const intptr_t kMaxDelta  = 0x7FFF0000LL;     /* just under 2 GB */
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    UINT_PTR lo = (UINT_PTR)si.lpMinimumApplicationAddress;
+    UINT_PTR hi = (UINT_PTR)si.lpMaximumApplicationAddress;
+
+    UINT_PTR origin = (UINT_PTR)nearAddr;
+    UINT_PTR minAddr = (origin > (UINT_PTR)kMaxDelta)
+                     ? (origin - kMaxDelta) : lo;
+    UINT_PTR maxAddr = (origin < (UINT_PTR)(hi - kMaxDelta))
+                     ? (origin + kMaxDelta) : hi;
+    if (minAddr < lo) minAddr = lo;
+    if (maxAddr > hi) maxAddr = hi;
+
+    /* Round to allocation granularity */
+    minAddr = (minAddr + kGranularity - 1) & ~(kGranularity - 1);
+    maxAddr = maxAddr & ~(kGranularity - 1);
+
+    /* Search outward from origin, alternating below/above */
+    for (UINT_PTR delta = kGranularity;
+         delta <= (UINT_PTR)kMaxDelta;
+         delta += kGranularity)
+    {
+        UINT_PTR candidates[2];
+        int nCandidates = 0;
+        if (origin >= delta && (origin - delta) >= minAddr)
+            candidates[nCandidates++] = (origin - delta) & ~(kGranularity - 1);
+        if ((origin + delta) <= maxAddr)
+            candidates[nCandidates++] = (origin + delta) & ~(kGranularity - 1);
+
+        for (int i = 0; i < nCandidates; i++) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery((LPCVOID)candidates[i], &mbi, sizeof(mbi)) &&
+                mbi.State == MEM_FREE && mbi.RegionSize >= size)
+            {
+                BYTE* p = (BYTE*)VirtualAlloc(
+                    (LPVOID)candidates[i], size,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (p) return p;
+            }
+        }
+    }
+
+    /* Last resort: unconstrained allocation (fixup will warn if needed) */
+    CLog("[MJ]   WARN: could not allocate within +/-2 GB of %p, "
+         "falling back to arbitrary address.", nearAddr);
+    return (BYTE*)VirtualAlloc(NULL, size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+}
+
 /* --- Internal: allocate a 14-byte executable JMP stub --- */
 
 static BYTE* MJ_AllocJmpStub(void* target)
@@ -919,16 +1149,72 @@ static MJ_HookSite* MJ_CreateSite(UINT_PTR rva, int stolenBytes)
     memcpy(site->origBytes, site->patchAddr,
            stolenBytes < 24 ? stolenBytes : 24);
 
-    /* Build original trampoline: stolen bytes + JMP back to original+N */
+    /* Build original trampoline: stolen bytes + JMP back to original+N.
+     * Allocate within +/-2 GB of the patch site so that any E8/E9 rel32
+     * instructions in the stolen bytes can be fixed up in-place. */
     int tramSz = stolenBytes + 14;
-    BYTE* tramp = (BYTE*)VirtualAlloc(NULL, tramSz,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    BYTE* tramp = MJ_AllocNear(patchAddr, tramSz);
     if (!tramp) {
         HeapFree(GetProcessHeap(), 0, site);
         return NULL;
     }
 
     memcpy(tramp, site->patchAddr, stolenBytes);   /* stolen prologue  */
+
+    /* --- RIP-relative fixup pass ---
+     * Scan the stolen bytes for E8 (call rel32) and E9 (jmp rel32)
+     * instructions.  Their 4-byte displacement is relative to the
+     * instruction's own address, so after relocation into the
+     * trampoline they point to the wrong place.  We rewrite each
+     * displacement so it resolves to the same absolute target as it
+     * did at the original location.
+     *
+     * This fixes prologues that contain a call to __chkstk (common
+     * for functions with large stack frames under MSVC x64).
+     *
+     * NOTE: This does NOT handle ModR/M-encoded RIP-relative
+     * instructions (e.g. LEA reg,[rip+disp], MOV reg,[rip+disp]).
+     * Those require full ModR/M decoding -- not needed for any
+     * current hook site but worth adding if new sites require it. */
+    {
+        int pos = 0;
+        while (pos < stolenBytes) {
+            int len = mj_lde(tramp + pos);
+            if (len <= 0) break;   /* shouldn't happen -- already validated */
+
+            BYTE opcode = tramp[pos];
+            if ((opcode == 0xE8 || opcode == 0xE9) && len == 5
+                && pos + 5 <= stolenBytes)
+            {
+                /* Read the original displacement */
+                int32_t origDisp;
+                memcpy(&origDisp, tramp + pos + 1, 4);
+
+                /* Compute the absolute target as it was at the original site */
+                UINT_PTR origInstrAddr = (UINT_PTR)site->patchAddr + pos;
+                UINT_PTR absTarget     = origInstrAddr + 5 + (int64_t)origDisp;
+
+                /* Compute the new displacement from the trampoline location */
+                UINT_PTR newInstrAddr  = (UINT_PTR)tramp + pos;
+                int64_t  newDisp64     = (int64_t)(absTarget - (newInstrAddr + 5));
+
+                if (newDisp64 >= -2147483648LL && newDisp64 <= 2147483647LL) {
+                    int32_t newDisp = (int32_t)newDisp64;
+                    memcpy(tramp + pos + 1, &newDisp, 4);
+                    CLog("[MJ]   Fixup: %s at stolen+%d -> abs 0x%llX (disp %+d -> %+d)",
+                         opcode == 0xE8 ? "call" : "jmp",
+                         pos, (unsigned long long)absTarget, origDisp, newDisp);
+                } else {
+                    CLog("[MJ]   WARNING: %s at stolen+%d target 0x%llX out of "
+                         "rel32 range from trampoline -- cannot fixup!",
+                         opcode == 0xE8 ? "call" : "jmp",
+                         pos, (unsigned long long)absTarget);
+                }
+            }
+            pos += len;
+        }
+    }
+
     tramp[stolenBytes + 0] = 0xFF;                 /* jmp qword [rip+0]*/
     tramp[stolenBytes + 1] = 0x25;
     tramp[stolenBytes + 2] = 0x00;
@@ -1370,6 +1656,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         }
 
         CLog("Mod loading deferred to first proxy call.");
+
+        /* Fallback: patch the game's entry point so that LoadModsOnce()
+         * is guaranteed to run even if no version.dll proxy export is
+         * ever called.  Safe to do here -- the entry point hasn't been
+         * called yet, and the trampoline executes after the loader lock
+         * is released.  If a proxy call fires first, the atomic guard
+         * in LoadModsOnce() makes this a no-op. */
+        if (!PatchEntryPointFallback())
+            CLog("WARNING: entry-point fallback failed; mods depend on "
+                 "a version.dll proxy call.");
         CLog("");
     }
     else if (reason == DLL_PROCESS_DETACH) {
