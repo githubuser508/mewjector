@@ -18,6 +18,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>      /* EnumProcessModules, GetModuleInformation for the crash handler */
 #include <stdio.h>
 #include <string.h>
 #include "mj_lde.h"
@@ -302,6 +303,7 @@ static int  g_loadedCount;
 
 static volatile LONG g_modsLoaded = 0;
 static void LoadModsOnce(void);   /* forward decl for entry-point fallback */
+static void StartCrashWatchdog(void);  /* forward decl; body in crash-handler block */
 
 /* --- Entry-point trampoline fallback ---
  *
@@ -484,6 +486,11 @@ static void LoadModsOnce(void)
     CLog("Mewjector API v%d available (MJ_InstallHook, MJ_RegisterName, ...)",
          MJ_API_VERSION);
     CLog("");
+
+    /* Start the crash-handler watchdog now that the loader lock is
+     * released. Idempotent. See StartCrashWatchdog for why it cannot
+     * run from DllMain. */
+    StartCrashWatchdog();
 
     /* Phase 1: [LoadOrder] priority DLLs — loaded first, in listed order */
     if (g_config.loadOrderCount > 0) {
@@ -1006,6 +1013,624 @@ static HANDLE        g_mjNameMutex  = NULL;
 
 static volatile LONG g_mjNextTypeId = MJ_TYPE_ID_BASE;
 
+/* Crash handler. SEH top-level filter (MjCrashFilter) catches unhandled
+ * exceptions. VEH (MjVectoredFilter) at priority 0 catches fatal codes
+ * that other filters might absorb. Watchdog re-installs the SEH filter
+ * every 2s. Reports written to mod_logs\crashes\<pid>-<timestamp>.{txt,dmp}.
+ * Write helpers use no heap and no CRT I/O, only WriteFile on stack
+ * buffers. Each subsection wrapped in __try so handler faults do not
+ * recurse. */
+
+static void CrashWriteHookList(HANDLE hFile);
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevUnhandledFilter = NULL;
+static PVOID                        g_vectoredHandlerReg  = NULL;
+static volatile LONG                g_crashHandlerEntered = 0;
+
+/* MiniDumpWriteDump signature for dbghelp.dll, loaded dynamically. */
+typedef BOOL (WINAPI *PFN_MiniDumpWriteDump)(
+    HANDLE hProcess, DWORD pid, HANDLE hFile,
+    DWORD dumpType, PVOID exceptionParam,
+    PVOID userStreamParam, PVOID callbackParam);
+
+/* MINIDUMP_EXCEPTION_INFORMATION layout, defined inline to avoid pulling in dbghelp.h. */
+typedef struct {
+    DWORD            ThreadId;
+    EXCEPTION_POINTERS* ExceptionPointers;
+    BOOL             ClientPointers;
+} MJ_MINIDUMP_EXCEPTION_INFORMATION;
+
+/* Minimal MiniDumpType flags we care about. */
+#define MJ_MiniDumpWithDataSegs              0x00000001
+#define MJ_MiniDumpWithFullMemory            0x00000002
+#define MJ_MiniDumpWithHandleData            0x00000004
+#define MJ_MiniDumpWithThreadInfo            0x00001000
+#define MJ_MiniDumpWithUnloadedModules       0x00000020
+#define MJ_MiniDumpWithIndirectlyReferencedMemory 0x00000040
+
+static void CrashWriteStr(HANDLE hFile, const char* s)
+{
+    if (!s) return;
+    DWORD len = (DWORD)strlen(s);
+    DWORD written = 0;
+    WriteFile(hFile, s, len, &written, NULL);
+}
+
+/* snprintf-to-buffer-and-WriteFile helper. Buffer is stack-local so we
+ * never hit the crashing heap. */
+#define CRASHF(hFile, ...) do { \
+    char _cbuf[1024]; \
+    int _cn = _snprintf(_cbuf, sizeof(_cbuf), __VA_ARGS__); \
+    if (_cn < 0 || _cn >= (int)sizeof(_cbuf)) _cn = (int)sizeof(_cbuf) - 1; \
+    DWORD _cw = 0; \
+    WriteFile((hFile), _cbuf, (DWORD)_cn, &_cw, NULL); \
+} while (0)
+
+static const char* CrashExceptionName(DWORD code)
+{
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:         return "ACCESS_VIOLATION";
+        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:    return "ARRAY_BOUNDS_EXCEEDED";
+        case EXCEPTION_BREAKPOINT:               return "BREAKPOINT";
+        case EXCEPTION_DATATYPE_MISALIGNMENT:    return "DATATYPE_MISALIGNMENT";
+        case EXCEPTION_FLT_DENORMAL_OPERAND:     return "FLT_DENORMAL_OPERAND";
+        case EXCEPTION_FLT_DIVIDE_BY_ZERO:       return "FLT_DIVIDE_BY_ZERO";
+        case EXCEPTION_FLT_INEXACT_RESULT:       return "FLT_INEXACT_RESULT";
+        case EXCEPTION_FLT_INVALID_OPERATION:    return "FLT_INVALID_OPERATION";
+        case EXCEPTION_FLT_OVERFLOW:             return "FLT_OVERFLOW";
+        case EXCEPTION_FLT_STACK_CHECK:          return "FLT_STACK_CHECK";
+        case EXCEPTION_FLT_UNDERFLOW:            return "FLT_UNDERFLOW";
+        case EXCEPTION_ILLEGAL_INSTRUCTION:      return "ILLEGAL_INSTRUCTION";
+        case EXCEPTION_IN_PAGE_ERROR:            return "IN_PAGE_ERROR";
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:       return "INT_DIVIDE_BY_ZERO";
+        case EXCEPTION_INT_OVERFLOW:             return "INT_OVERFLOW";
+        case EXCEPTION_INVALID_DISPOSITION:      return "INVALID_DISPOSITION";
+        case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "NONCONTINUABLE_EXCEPTION";
+        case EXCEPTION_PRIV_INSTRUCTION:         return "PRIV_INSTRUCTION";
+        case EXCEPTION_SINGLE_STEP:              return "SINGLE_STEP";
+        case EXCEPTION_STACK_OVERFLOW:           return "STACK_OVERFLOW";
+        case 0xE0434352:                          return "CLR_MANAGED_EXCEPTION";
+        case 0xE06D7363:                          return "CPP_EH_EXCEPTION";
+        default:                                  return "UNKNOWN";
+    }
+}
+
+/* Resolve an instruction address to "modulename.dll + 0xRVA". Returns TRUE
+ * if the address falls inside a loaded module, FALSE if it's stray. */
+static BOOL CrashResolveAddr(UINT_PTR addr, char* outModule, size_t outSize,
+                             UINT_PTR* outRva)
+{
+    HMODULE mods[512];
+    DWORD   needed = 0;
+    HANDLE  hProc  = GetCurrentProcess();
+
+    if (!EnumProcessModules(hProc, mods, sizeof(mods), &needed))
+        return FALSE;
+
+    int count = (int)(needed / sizeof(HMODULE));
+    if (count > 512) count = 512;
+
+    for (int i = 0; i < count; i++) {
+        MODULEINFO mi;
+        if (!GetModuleInformation(hProc, mods[i], &mi, sizeof(mi)))
+            continue;
+        UINT_PTR base = (UINT_PTR)mi.lpBaseOfDll;
+        UINT_PTR end  = base + mi.SizeOfImage;
+        if (addr < base || addr >= end) continue;
+
+        char path[MAX_PATH];
+        if (!GetModuleFileNameA(mods[i], path, MAX_PATH)) {
+            strncpy(outModule, "?", outSize);
+            outModule[outSize - 1] = '\0';
+        } else {
+            const char* leaf = strrchr(path, '\\');
+            leaf = leaf ? (leaf + 1) : path;
+            strncpy(outModule, leaf, outSize);
+            outModule[outSize - 1] = '\0';
+        }
+        *outRva = addr - base;
+        return TRUE;
+    }
+    strncpy(outModule, "?", outSize);
+    outModule[outSize - 1] = '\0';
+    *outRva = 0;
+    return FALSE;
+}
+
+static void CrashWriteHeader(HANDLE hFile, EXCEPTION_POINTERS* ep, SYSTEMTIME* stamp)
+{
+    EXCEPTION_RECORD* er = ep->ExceptionRecord;
+
+    CrashWriteStr(hFile, "=== Mewjector crash report ===\r\n");
+    CRASHF(hFile, "PID:            %lu\r\n",
+           (unsigned long)GetCurrentProcessId());
+    CRASHF(hFile, "Thread ID:      %lu\r\n",
+           (unsigned long)GetCurrentThreadId());
+    CRASHF(hFile, "Timestamp:      %04d-%02d-%02d %02d:%02d:%02d.%03d (local)\r\n",
+           stamp->wYear, stamp->wMonth, stamp->wDay,
+           stamp->wHour, stamp->wMinute, stamp->wSecond, stamp->wMilliseconds);
+    CRASHF(hFile, "Exception code: 0x%08lX (%s)\r\n",
+           (unsigned long)er->ExceptionCode, CrashExceptionName(er->ExceptionCode));
+    CRASHF(hFile, "Exception flag: 0x%08lX\r\n",
+           (unsigned long)er->ExceptionFlags);
+    CRASHF(hFile, "Fault address:  0x%p\r\n", er->ExceptionAddress);
+
+    char mod[128]; UINT_PTR rva = 0;
+    if (CrashResolveAddr((UINT_PTR)er->ExceptionAddress, mod, sizeof(mod), &rva))
+        CRASHF(hFile, "Fault location: %s + 0x%IX\r\n", mod, rva);
+    else
+        CrashWriteStr(hFile, "Fault location: (unresolved address)\r\n");
+
+    /* AV/In-page-error details: the NumberParameters[] describes the op. */
+    if ((er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+         er->ExceptionCode == EXCEPTION_IN_PAGE_ERROR)
+        && er->NumberParameters >= 2) {
+        const char* kind;
+        switch (er->ExceptionInformation[0]) {
+            case 0: kind = "read";    break;
+            case 1: kind = "write";   break;
+            case 8: kind = "execute"; break;
+            default: kind = "?";       break;
+        }
+        CRASHF(hFile, "AV detail:      %s at 0x%p\r\n",
+               kind, (void*)er->ExceptionInformation[1]);
+    }
+    CrashWriteStr(hFile, "\r\n");
+}
+
+static void CrashWriteRegisters(HANDLE hFile, CONTEXT* ctx)
+{
+#ifdef _M_X64
+    CrashWriteStr(hFile, "--- Registers (x64) ---\r\n");
+    CRASHF(hFile, "RIP=%016llX  RSP=%016llX  RBP=%016llX\r\n",
+           (unsigned long long)ctx->Rip,
+           (unsigned long long)ctx->Rsp,
+           (unsigned long long)ctx->Rbp);
+    CRASHF(hFile, "RAX=%016llX  RBX=%016llX  RCX=%016llX  RDX=%016llX\r\n",
+           (unsigned long long)ctx->Rax, (unsigned long long)ctx->Rbx,
+           (unsigned long long)ctx->Rcx, (unsigned long long)ctx->Rdx);
+    CRASHF(hFile, "RSI=%016llX  RDI=%016llX  R8 =%016llX  R9 =%016llX\r\n",
+           (unsigned long long)ctx->Rsi, (unsigned long long)ctx->Rdi,
+           (unsigned long long)ctx->R8,  (unsigned long long)ctx->R9);
+    CRASHF(hFile, "R10=%016llX  R11=%016llX  R12=%016llX  R13=%016llX\r\n",
+           (unsigned long long)ctx->R10, (unsigned long long)ctx->R11,
+           (unsigned long long)ctx->R12, (unsigned long long)ctx->R13);
+    CRASHF(hFile, "R14=%016llX  R15=%016llX  EFL=%08lX\r\n",
+           (unsigned long long)ctx->R14, (unsigned long long)ctx->R15,
+           (unsigned long)ctx->EFlags);
+#else
+    CrashWriteStr(hFile, "--- Registers (x86) ---\r\n");
+    CRASHF(hFile, "EIP=%08lX  ESP=%08lX  EBP=%08lX  EFL=%08lX\r\n",
+           (unsigned long)ctx->Eip, (unsigned long)ctx->Esp,
+           (unsigned long)ctx->Ebp, (unsigned long)ctx->EFlags);
+    CRASHF(hFile, "EAX=%08lX  EBX=%08lX  ECX=%08lX  EDX=%08lX\r\n",
+           (unsigned long)ctx->Eax, (unsigned long)ctx->Ebx,
+           (unsigned long)ctx->Ecx, (unsigned long)ctx->Edx);
+    CRASHF(hFile, "ESI=%08lX  EDI=%08lX\r\n",
+           (unsigned long)ctx->Esi, (unsigned long)ctx->Edi);
+#endif
+    CrashWriteStr(hFile, "\r\n");
+}
+
+/* Quick stack backtrace: dump the first N pointer-sized words at RSP
+ * and resolve each one that looks like a code address. No StackWalk64
+ * is used here. The backtrace path avoids pulling in dbghelp. dbghelp
+ * is loaded dynamically only for the minidump. This will not perfectly
+ * reconstruct unwind but gives useful return-address breadcrumbs. */
+static void CrashWriteBacktrace(HANDLE hFile, CONTEXT* ctx)
+{
+    CrashWriteStr(hFile, "--- Approximate backtrace (raw stack walk) ---\r\n");
+#ifdef _M_X64
+    UINT_PTR rsp = (UINT_PTR)ctx->Rsp;
+#else
+    UINT_PTR rsp = (UINT_PTR)ctx->Esp;
+#endif
+    /* Probe up to 256 slots looking for pointers into loaded modules. */
+    __try {
+        int printed = 0;
+        for (int i = 0; i < 256 && printed < 32; i++) {
+            UINT_PTR slot = rsp + i * sizeof(UINT_PTR);
+            UINT_PTR val  = *(UINT_PTR*)slot;
+
+            /* Coarse filter: must look like a user-mode code pointer. */
+            if (val < 0x10000 || val > 0x00007FFFFFFFFFFFULL) continue;
+
+            char mod[128]; UINT_PTR rva = 0;
+            if (!CrashResolveAddr(val, mod, sizeof(mod), &rva)) continue;
+
+            CRASHF(hFile, "  [%02d] sp+%04X  0x%016llX  %s + 0x%IX\r\n",
+                   printed, (unsigned)(i * sizeof(UINT_PTR)),
+                   (unsigned long long)val, mod, rva);
+            printed++;
+        }
+        if (printed == 0)
+            CrashWriteStr(hFile, "  (no resolvable return addresses in 256-slot window)\r\n");
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        CrashWriteStr(hFile, "  (stack probe faulted; state is unrecoverable)\r\n");
+    }
+    CrashWriteStr(hFile, "\r\n");
+}
+
+static void CrashWriteModuleList(HANDLE hFile)
+{
+    CrashWriteStr(hFile, "--- Loaded modules ---\r\n");
+    HMODULE mods[512];
+    DWORD   needed = 0;
+    HANDLE  hProc  = GetCurrentProcess();
+    if (!EnumProcessModules(hProc, mods, sizeof(mods), &needed)) {
+        CrashWriteStr(hFile, "  (EnumProcessModules failed)\r\n\r\n");
+        return;
+    }
+    int count = (int)(needed / sizeof(HMODULE));
+    if (count > 512) count = 512;
+
+    for (int i = 0; i < count; i++) {
+        MODULEINFO mi; memset(&mi, 0, sizeof(mi));
+        GetModuleInformation(hProc, mods[i], &mi, sizeof(mi));
+        char path[MAX_PATH] = {0};
+        GetModuleFileNameA(mods[i], path, MAX_PATH);
+        CRASHF(hFile, "  0x%016llX  size=0x%08lX  %s\r\n",
+               (unsigned long long)(UINT_PTR)mi.lpBaseOfDll,
+               (unsigned long)mi.SizeOfImage,
+               path);
+    }
+    CrashWriteStr(hFile, "\r\n");
+}
+
+/* Walk the Mewjector hook chain and dump every site + entry. Called from
+ * the top-level exception filter. No mutex acquisition. The process may
+ * be mid-crash with the mutex forever held, so a best-effort walk inside
+ * __try/__except is preferred over deadlocking. */
+static void CrashWriteHookList(HANDLE hFile)
+{
+    CrashWriteStr(hFile, "--- Mewjector installed hooks ---\r\n");
+    MJ_HookSite* s = g_mjHookSites;
+    if (!s) {
+        CrashWriteStr(hFile, "  (no hooks installed)\r\n\r\n");
+        return;
+    }
+    __try {
+        int siteIdx = 0;
+        while (s && siteIdx < 256) {
+            CRASHF(hFile, "  site[%d] RVA=0x%IX  patchAddr=0x%p  stolen=%d\r\n",
+                   siteIdx, s->rva, s->patchAddr, s->stolenBytes);
+            MJ_HookEntry* e = s->chain;
+            int entIdx = 0;
+            while (e && entIdx < 32) {
+                CRASHF(hFile, "    [%d] fn=0x%p  pri=%d  owner=%s\r\n",
+                       entIdx, e->hookFn, e->priority,
+                       e->owner[0] ? e->owner : "(anon)");
+                e = e->next;
+                entIdx++;
+            }
+            s = s->nextSite;
+            siteIdx++;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        CrashWriteStr(hFile, "  (hook-chain walk faulted)\r\n");
+    }
+    CrashWriteStr(hFile, "\r\n");
+}
+
+/* Context passed to the minidump helper thread. The faulting thread is
+ * NOT the helper. It is the thread WriteCrashReport ran on. The helper
+ * suspends and captures the faulting thread per the MiniDumpWriteDump
+ * contract. */
+typedef struct {
+    EXCEPTION_POINTERS* ep;
+    DWORD               crashedThreadId;   /* the thread that took the AV */
+    const char*         dumpPath;
+    BOOL                success;           /* set by helper */
+    DWORD               winErr;            /* GetLastError() if !success */
+    DWORD               bytesWritten;      /* GetFileSize after write */
+} MJ_MiniDumpHelperCtx;
+
+static DWORD WINAPI MiniDumpHelperThread(LPVOID lpParam)
+{
+    MJ_MiniDumpHelperCtx* ctx = (MJ_MiniDumpHelperCtx*)lpParam;
+    ctx->success = FALSE;
+    ctx->winErr  = 0;
+    ctx->bytesWritten = 0;
+
+    HMODULE hDbg = LoadLibraryA("dbghelp.dll");
+    if (!hDbg) { ctx->winErr = GetLastError(); return 0; }
+
+    PFN_MiniDumpWriteDump pWrite = (PFN_MiniDumpWriteDump)
+        GetProcAddress(hDbg, "MiniDumpWriteDump");
+    if (!pWrite) { ctx->winErr = GetLastError(); FreeLibrary(hDbg); return 0; }
+
+    /* GENERIC_READ | GENERIC_WRITE: dbghelp internally re-reads its own
+     * writes to compute stream offsets. WRITE-only file handles caused
+     * 0-byte dumps in the 25628-20260425-224319 incident. */
+    HANDLE hDump = CreateFileA(ctx->dumpPath,
+                               GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hDump == INVALID_HANDLE_VALUE) {
+        ctx->winErr = GetLastError();
+        FreeLibrary(hDbg);
+        return 0;
+    }
+
+    MJ_MINIDUMP_EXCEPTION_INFORMATION mei;
+    mei.ThreadId          = ctx->crashedThreadId;  /* NOT GetCurrentThreadId */
+    mei.ExceptionPointers = ctx->ep;
+    mei.ClientPointers    = FALSE;
+
+    DWORD type = MJ_MiniDumpWithDataSegs
+               | MJ_MiniDumpWithHandleData
+               | MJ_MiniDumpWithThreadInfo
+               | MJ_MiniDumpWithUnloadedModules
+               | MJ_MiniDumpWithIndirectlyReferencedMemory;
+
+    BOOL ok = pWrite(GetCurrentProcess(), GetCurrentProcessId(),
+                     hDump, type, &mei, NULL, NULL);
+    if (!ok) ctx->winErr = GetLastError();
+
+    /* Capture file size BEFORE closing so we can audit empty-write bugs. */
+    DWORD sizeHi = 0;
+    DWORD sizeLo = GetFileSize(hDump, &sizeHi);
+    if (sizeLo != INVALID_FILE_SIZE) ctx->bytesWritten = sizeLo;
+
+    CloseHandle(hDump);
+    FreeLibrary(hDbg);
+
+    ctx->success = ok && (ctx->bytesWritten > 0);
+    return 0;
+}
+
+static void CrashWriteMinidump(EXCEPTION_POINTERS* ep,
+                               const char* crashDir, const char* stamp)
+{
+    /* MiniDumpWriteDump must be called from a separate thread. Called
+     * inline on the crashing thread it cannot capture the faulting
+     * thread's context, and silently produces a 0-byte file. The helper
+     * thread pattern is the documented Microsoft recommendation:
+     *   https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/nf-minidumpapiset-minidumpwritedump
+     */
+
+    char dumpPath[MAX_PATH];
+    _snprintf(dumpPath, MAX_PATH, "%s\\%lu-%s.dmp",
+              crashDir, (unsigned long)GetCurrentProcessId(), stamp);
+
+    MJ_MiniDumpHelperCtx ctx;
+    ctx.ep              = ep;
+    ctx.crashedThreadId = GetCurrentThreadId();
+    ctx.dumpPath        = dumpPath;
+    ctx.success         = FALSE;
+    ctx.winErr          = 0;
+    ctx.bytesWritten    = 0;
+
+    HANDLE hThread = CreateThread(NULL, 0, MiniDumpHelperThread, &ctx,
+                                  0, NULL);
+    if (hThread == NULL) {
+        if (g_logFile) {
+            CLog("[crash] CreateThread for minidump helper failed: err=%lu",
+                 (unsigned long)GetLastError());
+            fflush(g_logFile);
+        }
+        return;
+    }
+
+    /* 30s budget: a full memory snapshot of a 21 MB exe + game heap is
+     * typically < 1s, but disk pressure or AV scanners can stall. */
+    DWORD waitRes = WaitForSingleObject(hThread, 30000);
+    if (waitRes == WAIT_TIMEOUT) {
+        if (g_logFile) {
+            CLog("[crash] minidump helper timed out after 30s; abandoning");
+            fflush(g_logFile);
+        }
+        /* Do not kill the thread. It is holding dbghelp internal locks.
+         * Leak the handle and let the OS clean up at process exit. */
+        return;
+    }
+    CloseHandle(hThread);
+
+    if (g_logFile) {
+        CLog("[crash] minidump: success=%d bytes=%lu winErr=%lu path=%s",
+             ctx.success ? 1 : 0,
+             (unsigned long)ctx.bytesWritten,
+             (unsigned long)ctx.winErr,
+             dumpPath);
+        fflush(g_logFile);
+    }
+}
+
+/* Shared writer: called from both the SEH top-level filter and from the
+ * VEH fallback. 'source' is a short tag that goes into the report and
+ * the chainloader log to identify which path fired. Returns TRUE if a
+ * report was written, FALSE if re-entered (another handler is already
+ * writing). */
+static BOOL WriteCrashReport(EXCEPTION_POINTERS* ep, const char* source)
+{
+    /* Re-entrancy guard: if the filter itself faults and re-enters, or
+     * if both VEH and SEH fire for the same event, get out of the way. */
+    if (InterlockedCompareExchange(&g_crashHandlerEntered, 1, 0) != 0)
+        return FALSE;
+
+    SYSTEMTIME st; GetLocalTime(&st);
+    char stamp[32];
+    _snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    /* Ensure the crash directory exists. Both mod_logs and its crashes
+     * child may need to be created; CreateDirectoryA is idempotent. */
+    {
+        char parent[MAX_PATH];
+        _snprintf(parent, MAX_PATH, "%smod_logs", g_baseDir);
+        CreateDirectoryA(parent, NULL);
+    }
+    char crashDir[MAX_PATH];
+    _snprintf(crashDir, MAX_PATH, "%smod_logs\\crashes", g_baseDir);
+    CreateDirectoryA(crashDir, NULL);
+
+    char txtPath[MAX_PATH];
+    _snprintf(txtPath, MAX_PATH, "%s\\%lu-%s.txt",
+              crashDir, (unsigned long)GetCurrentProcessId(), stamp);
+
+    HANDLE hFile = CreateFileA(txtPath,
+                               GENERIC_WRITE, FILE_SHARE_READ,
+                               NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        CRASHF(hFile, "Source:         %s\r\n", source ? source : "(?)");
+        __try { CrashWriteHeader   (hFile, ep, &st); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        __try { CrashWriteRegisters(hFile, ep->ContextRecord); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        __try { CrashWriteBacktrace(hFile, ep->ContextRecord); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        __try { CrashWriteModuleList(hFile); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        __try { CrashWriteHookList (hFile); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        CrashWriteStr(hFile, "=== end of crash report ===\r\n");
+        CloseHandle(hFile);
+    }
+
+    /* Minidump: separate __try because MiniDumpWriteDump can itself
+     * fault on very broken processes. */
+    __try { CrashWriteMinidump(ep, crashDir, stamp); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+    /* Flush the normal chainloader log so whatever CLog output preceded
+     * the crash is on disk. Also log an audit entry so the chainloader
+     * log carries a breadcrumb. Useful when the crash report file itself
+     * fails to reach disk (bad path, locked handle, etc.). */
+    if (g_logFile) {
+        __try {
+            CLog("[crash] WriteCrashReport fired: source=%s code=0x%08lX @ %p -> %s",
+                 source ? source : "(?)",
+                 (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                 ep->ExceptionRecord->ExceptionAddress,
+                 (hFile != INVALID_HANDLE_VALUE) ? txtPath : "(file write failed)");
+            fflush(g_logFile);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    return TRUE;
+}
+
+static LONG WINAPI MjCrashFilter(EXCEPTION_POINTERS* ep)
+{
+    WriteCrashReport(ep, "SEH-top-level");
+
+    /* Chain to the previous filter (WER, debugger, anything the game
+     * may have installed itself). Returning EXCEPTION_CONTINUE_SEARCH
+     * if there's no previous filter lets the default OS handling
+     * proceed (WER pops up, process exits, etc.). */
+    return g_prevUnhandledFilter
+        ? g_prevUnhandledFilter(ep)
+        : EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* VEH: fires before SEH unwinding. Filtered to fatal-only codes plus
+ * NONCONTINUABLE to avoid spamming reports for routine throw/catch.
+ * Always returns CONTINUE_SEARCH so other handlers still run. */
+static LONG WINAPI MjVectoredFilter(EXCEPTION_POINTERS* ep)
+{
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code  = ep->ExceptionRecord->ExceptionCode;
+    DWORD flags = ep->ExceptionRecord->ExceptionFlags;
+
+    BOOL fatal = FALSE;
+    switch (code) {
+        case EXCEPTION_STACK_OVERFLOW:      /* always fatal */
+        case 0xC0000409:                    /* STATUS_STACK_BUFFER_OVERRUN / __fastfail */
+        case 0xC000041D:                    /* STATUS_FATAL_USER_CALLBACK_EXCEPTION */
+            fatal = TRUE;
+            break;
+        default:
+            break;
+    }
+    /* A handler that declared itself non-continuable is by definition
+     * unrecoverable; write even if the code is otherwise routine. */
+    if (flags & EXCEPTION_NONCONTINUABLE) fatal = TRUE;
+
+    if (!fatal) return EXCEPTION_CONTINUE_SEARCH;
+
+    WriteCrashReport(ep, "VEH-fatal");
+    /* Observer only: let the exception continue propagating so SEH and
+     * whatever else is in the chain gets to run. */
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Watchdog thread. The game (or the CLR, or any other late-loaded DLL)
+ * can call SetUnhandledExceptionFilter() after MjCrashFilter is
+ * installed, displacing it from the top of the chain. The watchdog
+ * periodically re-installs MjCrashFilter and captures whatever was
+ * displaced, so MjCrashFilter chains into it and the prior filter's
+ * behaviour (WER, game's own dialog, etc.) is preserved. */
+static DWORD WINAPI CrashFilterWatchdog(LPVOID param)
+{
+    (void)param;
+    ULONGLONG tick = 0;
+    for (;;) {
+        Sleep(2000);
+        tick++;
+
+        LPTOP_LEVEL_EXCEPTION_FILTER prev =
+            SetUnhandledExceptionFilter(&MjCrashFilter);
+        if (prev != &MjCrashFilter && prev != NULL) {
+            /* A different filter was installed between the previous
+             * watchdog tick and now. Capture it so MjCrashFilter chains
+             * into it. */
+            g_prevUnhandledFilter = prev;
+            CLog("[crash] Watchdog: re-claimed top-level filter; " \
+                 "chained prev=%p", (void*)prev);
+        }
+
+        /* Heartbeat every 5 ticks (~10s). Brackets time-of-death for
+         * crashes that bypass SEH/VEH entirely (__fastfail, ExitProcess,
+         * TerminateProcess). Cadence kept coarse so the log does not
+         * turn into noise for healthy runs. */
+        if ((tick % 5) == 0) {
+            CLog("[crash] heartbeat: process alive at tick %llu",
+                 (unsigned long long)tick);
+            if (g_logFile) fflush(g_logFile);
+        }
+    }
+    /* Unreachable, but keep /W3 happy on older toolchains that don't
+     * recognise an infinite loop as a no-return tail. */
+    return 0;
+}
+
+/* DllMain-time install. Watchdog thread is deferred to StartCrashWatchdog
+ * because CreateThread from DllMain deadlocks against the loader lock. */
+static void InstallCrashHandler(void)
+{
+    /* Layer 1: top-level SEH filter. Fires on unhandled exceptions
+     * that have escaped every __except frame in the process. */
+    g_prevUnhandledFilter = SetUnhandledExceptionFilter(&MjCrashFilter);
+
+    /* Layer 2: vectored handler at FirstHandler=0 (called last). Avoids
+     * doubling up with another priority-1 VEH (e.g. CSF's). */
+    g_vectoredHandlerReg = AddVectoredExceptionHandler(0, &MjVectoredFilter);
+
+    /* Force some CRT initialization the filter might rely on (path
+     * resolution, etc.) by doing a tiny warmup. Avoids surprises inside
+     * the filter if it hasn't been touched yet. */
+    SYSTEMTIME dummy; GetLocalTime(&dummy); (void)dummy;
+
+    CLog("[crash] Baseline crash handler installed "
+         "(SEH+VEH). Reports -> mod_logs\\crashes\\");
+}
+
+/* Called from LoadModsOnce after the loader lock has been released.
+ * Creates the watchdog thread that periodically re-installs MjCrashFilter
+ * if the game (or CLR, or any late-loaded DLL) displaces it.
+ * Idempotent: guards against being called more than once. */
+static LONG g_watchdogStarted = 0;
+static void StartCrashWatchdog(void)
+{
+    if (InterlockedCompareExchange(&g_watchdogStarted, 1, 0) != 0) return;
+
+    HANDLE hThread = CreateThread(NULL, 0, &CrashFilterWatchdog, NULL, 0, NULL);
+    if (hThread) {
+        CloseHandle(hThread);
+        CLog("[crash] Watchdog thread started "
+             "(re-installs top-level filter every 2s).");
+    } else {
+        CLog("[crash] Watchdog thread creation failed: GetLastError=%lu. "
+             "Crash handler still active via SEH+VEH.",
+             (unsigned long)GetLastError());
+    }
+}
+
 /* --- Internal: find existing hook site by RVA --- */
 
 static MJ_HookSite* MJ_FindSite(UINT_PTR rva)
@@ -1013,6 +1638,109 @@ static MJ_HookSite* MJ_FindSite(UINT_PTR rva)
     for (MJ_HookSite* s = g_mjHookSites; s; s = s->nextSite)
         if (s->rva == rva) return s;
     return NULL;
+}
+
+/* Diagnostic for VirtualAlloc returning NX or refusing PAGE_EXECUTE_*
+ * (ACG, EDR hook, Smart App Control, HVCI, etc.). Verbose triage is
+ * logged once per process. A one-line summary fires on every subsequent
+ * failure. */
+
+static volatile LONG g_mjDynCodeDiagLogged = 0;
+
+static void MJ_DiagnoseDynamicCodeBlocked(const char* purpose,
+                                          void* page,
+                                          SIZE_T size,
+                                          DWORD lastError,
+                                          DWORD observedProtect)
+{
+    /* One-line summary, always emitted. */
+    CLog("[MJ] DYNAMIC CODE BLOCKED while allocating %s "
+         "(page=%p size=0x%IX protect=0x%X GetLastError=0x%X). "
+         "The trampoline cannot be made executable on this machine.",
+         purpose ? purpose : "executable memory",
+         page, (size_t)size,
+         (unsigned)observedProtect, (unsigned)lastError);
+
+    /* Verbose triage block, emitted once per process. */
+    if (InterlockedExchange(&g_mjDynCodeDiagLogged, 1) != 0)
+        return;
+
+    CLog("[MJ] First occurrence in this process. Likely root causes "
+         "(per-machine, not per-build):");
+    CLog("[MJ]   1. Arbitrary Code Guard (ACG) enabled for the host EXE "
+         "in Windows Exploit Protection.");
+    CLog("[MJ]   2. EDR/AV filtering NtAllocateVirtualMemory or "
+         "NtProtectVirtualMemory and silently stripping EXECUTE bits "
+         "(CrowdStrike, SentinelOne, ESET, Trend Micro, Sophos "
+         "Intercept X, corporate Bitdefender, etc.).");
+    CLog("[MJ]   3. Windows 11 Smart App Control on an unsigned "
+         "process tree.");
+    CLog("[MJ]   4. HVCI / Memory Integrity with VBS-enforced ACG "
+         "(Windows 11 22H2+).");
+    CLog("[MJ]   5. Group-policy mitigation on a managed machine "
+         "(corporate / AAD-joined). OneDrive-redirected Documents/"
+         "Desktop is a soft signal here.");
+    CLog("[MJ]   6. Another loaded module having called "
+         "SetProcessMitigationPolicy(ProcessDynamicCodePolicy, "
+         "ProhibitDynamicCode=1) earlier in the load order.");
+    CLog("[MJ] User triage:");
+    CLog("[MJ]   PowerShell: Get-ProcessMitigation -Name <host>.exe");
+    CLog("[MJ]   GUI: Settings -> Windows Security -> App & browser "
+         "control -> Exploit protection -> Program settings -> "
+         "<host>.exe -> uncheck 'Arbitrary code guard (ACG)' and "
+         "'Block low integrity images'.");
+    CLog("[MJ]   Also check: Smart App Control state, Core isolation "
+         "-> Memory integrity, and any third-party EDR/AV configured "
+         "to block dynamic code in unsigned processes.");
+    CLog("[MJ] Effect: this hook installation will fail. Mods that "
+         "depend on Mewjector hooks will report install failure and "
+         "may fall back to raw mode or refuse to load. Disable the "
+         "offending mitigation for the host EXE and relaunch.");
+}
+
+/* --- Internal: verify a page is committed and has executable protection.
+ * Returns 1 if executable, 0 otherwise. */
+
+static int MJ_PageIsExecutable(void* page)
+{
+    if (!page) return 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((LPCVOID)page, &mbi, sizeof(mbi)) != sizeof(mbi))
+        return 0;
+    if (mbi.State != MEM_COMMIT)
+        return 0;
+    DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (mbi.Protect & execMask) ? 1 : 0;
+}
+
+/* Probe a freshly returned VirtualAlloc result and decide whether it
+ * is a usable executable page. If yes, return the pointer. If no
+ * (allocation failed with ERROR_DYNAMIC_CODE_BLOCKED, or the page came
+ * back without EXECUTE bits), emit the dynamic-code-blocked diagnostic,
+ * free the page when present, and return NULL. Other allocation
+ * failures (e.g. region conflicts) are returned silently as NULL so
+ * the caller can keep searching. */
+
+static BYTE* MJ_FinalizeExecAlloc(BYTE* page, SIZE_T size, const char* purpose)
+{
+    if (!page) {
+        DWORD le = GetLastError();
+        if (le == ERROR_DYNAMIC_CODE_BLOCKED || le == ERROR_ACCESS_DENIED)
+            MJ_DiagnoseDynamicCodeBlocked(purpose, NULL, size, le, 0);
+        return NULL;
+    }
+    if (!MJ_PageIsExecutable(page)) {
+        MEMORY_BASIC_INFORMATION mbi;
+        DWORD observed = 0;
+        if (VirtualQuery((LPCVOID)page, &mbi, sizeof(mbi)) == sizeof(mbi))
+            observed = mbi.Protect;
+        MJ_DiagnoseDynamicCodeBlocked(purpose, page, size,
+                                      GetLastError(), observed);
+        VirtualFree(page, 0, MEM_RELEASE);
+        return NULL;
+    }
+    return page;
 }
 
 /* --- Internal: allocate RWX memory within +/-2 GB of 'nearAddr' ---
@@ -1066,7 +1794,34 @@ static BYTE* MJ_AllocNear(void* nearAddr, SIZE_T size)
                 BYTE* p = (BYTE*)VirtualAlloc(
                     (LPVOID)candidates[i], size,
                     MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-                if (p) return p;
+                if (p) {
+                    if (MJ_PageIsExecutable(p)) return p;
+                    /* Allocation succeeded but the page came back
+                     * without EXECUTE. This indicates a process-wide
+                     * dynamic-code block, so other candidates would
+                     * fail the same way. Diagnose, free, and bail. */
+                    {
+                        DWORD observed = 0;
+                        MEMORY_BASIC_INFORMATION m;
+                        if (VirtualQuery((LPCVOID)p, &m, sizeof(m)) == sizeof(m))
+                            observed = m.Protect;
+                        MJ_DiagnoseDynamicCodeBlocked(
+                            "near-trampoline", p, size,
+                            GetLastError(), observed);
+                    }
+                    VirtualFree(p, 0, MEM_RELEASE);
+                    return NULL;
+                }
+                /* VirtualAlloc returned NULL. If the system explicitly
+                 * refused executable memory, no other candidate will
+                 * succeed either. Diagnose and bail. */
+                if (GetLastError() == ERROR_DYNAMIC_CODE_BLOCKED) {
+                    MJ_DiagnoseDynamicCodeBlocked(
+                        "near-trampoline", NULL, size,
+                        ERROR_DYNAMIC_CODE_BLOCKED, 0);
+                    return NULL;
+                }
+                /* Otherwise: probably a region conflict, keep searching. */
             }
         }
     }
@@ -1074,8 +1829,11 @@ static BYTE* MJ_AllocNear(void* nearAddr, SIZE_T size)
     /* Last resort: unconstrained allocation (fixup will warn if needed) */
     CLog("[MJ]   WARN: could not allocate within +/-2 GB of %p, "
          "falling back to arbitrary address.", nearAddr);
-    return (BYTE*)VirtualAlloc(NULL, size,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    {
+        BYTE* p = (BYTE*)VirtualAlloc(NULL, size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        return MJ_FinalizeExecAlloc(p, size, "near-trampoline-fallback");
+    }
 }
 
 /* --- Internal: allocate a 14-byte executable JMP stub --- */
@@ -1084,6 +1842,7 @@ static BYTE* MJ_AllocJmpStub(void* target)
 {
     BYTE* stub = (BYTE*)VirtualAlloc(NULL, 14,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    stub = MJ_FinalizeExecAlloc(stub, 14, "hook-jmp-stub");
     if (!stub) return NULL;
 
     /*  FF 25 00 00 00 00   jmp qword ptr [rip+0]
@@ -1162,27 +1921,37 @@ static MJ_HookSite* MJ_CreateSite(UINT_PTR rva, int stolenBytes)
     memcpy(tramp, site->patchAddr, stolenBytes);   /* stolen prologue  */
 
     /* --- RIP-relative fixup pass ---
-     * Scan the stolen bytes for E8 (call rel32) and E9 (jmp rel32)
-     * instructions.  Their 4-byte displacement is relative to the
-     * instruction's own address, so after relocation into the
-     * trampoline they point to the wrong place.  We rewrite each
-     * displacement so it resolves to the same absolute target as it
-     * did at the original location.
+     * Scan the stolen bytes for any instruction whose encoding references
+     * RIP, and rewrite its 4-byte displacement so it resolves to the same
+     * absolute target from the trampoline's location.  Two classes:
      *
-     * This fixes prologues that contain a call to __chkstk (common
-     * for functions with large stack frames under MSVC x64).
+     *   1. E8 / E9 rel32 (call rel32 / jmp rel32).  Common in prologues
+     *      that call __chkstk for large stack frames.
      *
-     * NOTE: This does NOT handle ModR/M-encoded RIP-relative
-     * instructions (e.g. LEA reg,[rip+disp], MOV reg,[rip+disp]).
-     * Those require full ModR/M decoding -- not needed for any
-     * current hook site but worth adding if new sites require it. */
+     *   2. ModR/M-encoded [rip+disp32] operands (mod==00, rm==101).
+     *      Common in prologues that touch globals or call indirect:
+     *      MOV [rip+d], reg / MOV reg,[rip+d] / LEA reg,[rip+d] /
+     *      FF 15 [rip+d] (call indirect) / FF 25 [rip+d] (jmp indirect).
+     *      Length-disassembled via mj_lde_ex; the disp32 offset within
+     *      the instruction comes back as info.rip_rel_disp_offset.
+     *
+     * Both classes share the same abs-target math: take the original
+     * instruction's end address (the PC value used to resolve the
+     * disp32), add the original disp32, then subtract the new
+     * instruction's end address to get the new disp32. Because
+     * MJ_AllocNear allocates the trampoline within +/-2 GB of the
+     * patch site, the difference always fits in int32 and the fixup
+     * succeeds. Out-of-range cases are logged and flagged. */
     {
         int pos = 0;
         while (pos < stolenBytes) {
-            int len = mj_lde(tramp + pos);
+            mj_lde_info ldi = mj_lde_ex(tramp + pos);
+            int len = ldi.length;
             if (len <= 0) break;   /* shouldn't happen -- already validated */
 
             BYTE opcode = tramp[pos];
+
+            /* Class 1: E8 / E9 rel32 ------------------------------------ */
             if ((opcode == 0xE8 || opcode == 0xE9) && len == 5
                 && pos + 5 <= stolenBytes)
             {
@@ -1211,6 +1980,37 @@ static MJ_HookSite* MJ_CreateSite(UINT_PTR rva, int stolenBytes)
                          pos, (unsigned long long)absTarget);
                 }
             }
+            /* Class 2: ModR/M [rip+disp32] ------------------------------ */
+            else if (ldi.rip_rel_disp_offset >= 0
+                  && pos + ldi.rip_rel_disp_offset + 4 <= stolenBytes)
+            {
+                int      dispPos       = pos + ldi.rip_rel_disp_offset;
+                int32_t  origDisp;
+                memcpy(&origDisp, tramp + dispPos, 4);
+
+                UINT_PTR origInstrAddr = (UINT_PTR)site->patchAddr + pos;
+                UINT_PTR origInstrEnd  = origInstrAddr + len;
+                UINT_PTR absTarget     = origInstrEnd + (int64_t)origDisp;
+
+                UINT_PTR newInstrAddr  = (UINT_PTR)tramp + pos;
+                UINT_PTR newInstrEnd   = newInstrAddr + len;
+                int64_t  newDisp64     = (int64_t)(absTarget - newInstrEnd);
+
+                if (newDisp64 >= -2147483648LL && newDisp64 <= 2147483647LL) {
+                    int32_t newDisp = (int32_t)newDisp64;
+                    memcpy(tramp + dispPos, &newDisp, 4);
+                    CLog("[MJ]   Fixup: ModR/M [rip+disp32] at stolen+%d "
+                         "-> abs 0x%llX (disp %+d -> %+d, len=%d)",
+                         pos, (unsigned long long)absTarget,
+                         origDisp, newDisp, len);
+                } else {
+                    CLog("[MJ]   WARNING: ModR/M [rip+disp32] at stolen+%d "
+                         "target 0x%llX out of rel32 range from "
+                         "trampoline -- cannot fixup!",
+                         pos, (unsigned long long)absTarget);
+                }
+            }
+
             pos += len;
         }
     }
@@ -1635,7 +2435,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         g_mjHookMutex = CreateMutexA(NULL, FALSE, NULL);
         g_mjNameMutex = CreateMutexA(NULL, FALSE, NULL);
 
+        /* Install the SEH+VEH crash handlers as early as possible so
+         * any AV or __fastfail that fires during mod load (or during
+         * the patched init wrapper) gets captured to mod_logs\crashes\.
+         * Watchdog thread is deferred to LoadModsOnce because
+         * CreateThread from DllMain risks loader-lock deadlock. */
+        InstallCrashHandler();
+
+#ifdef MJ_DEBUG_BUILD
+        CLog("=== Mewjector DEBUGv3.x (build %s, RIP-rel-fixup-v2) ===",
+             __DATE__);
+#else
         CLog("=== Mewjector v3.0 ===");
+#endif
         CLog("Process: PID %lu", GetCurrentProcessId());
         CLog("Game directory: %s", g_baseDir);
         CLog("");

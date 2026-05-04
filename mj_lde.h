@@ -16,6 +16,15 @@
  *      Returns the byte length of the instruction starting at p, or 0 on
  *      failure (unknown opcode, malformed encoding, VEX/EVEX, etc.).
  *
+ *      mj_lde_info mj_lde_ex(const uint8_t* p);
+ *      Same as mj_lde, but also reports the position of any RIP-relative
+ *      disp32 within the instruction (rip_rel_disp_offset, in bytes from
+ *      the start of the instruction, or -1 if the instruction has no
+ *      RIP-relative encoding). Used by the chainloader's stolen-byte
+ *      fixup pass to relocate ModR/M [rip+disp32] operands. This includes
+ *      the indirect-call (FF 15 ..) and indirect-jmp (FF 25 ..) encodings,
+ *      which are just FF with mod=00, rm=101.
+ *
  *  Single-header, no dependencies, safe to include from C and C++.
  * ============================================================================
  */
@@ -125,11 +134,31 @@ static const uint8_t mj_lde_op0F[256] = {
 };
 
 /* ---------------------------------------------------------------------------
- *  Length decoder
+ *  Length decoder (extended)
+ *
+ *  mj_lde_info is the extended return value: the instruction length plus
+ *  the byte offset of any RIP-relative disp32 within the instruction
+ *  (-1 if there is no RIP-relative encoding).  The plain mj_lde() below
+ *  is a thin wrapper that returns just the .length field, kept for
+ *  callers that don't need the disp offset.
  * --------------------------------------------------------------------------- */
 
-static int mj_lde(const uint8_t* p)
+typedef struct {
+    int length;               /* instruction length in bytes, or 0 on failure */
+    int rip_rel_disp_offset;  /* byte offset of disp32 within the instruction,
+                                 or -1 if the instruction has no RIP-relative
+                                 encoding. RIP-relative encoding is exactly
+                                 ModR/M with mod==00 and rm==101, which covers
+                                 LEA/MOV [rip+d], FF 15 [rip+d] (call indirect),
+                                 FF 25 [rip+d] (jmp indirect), and similar.    */
+} mj_lde_info;
+
+static mj_lde_info mj_lde_ex(const uint8_t* p)
 {
+    mj_lde_info info;
+    info.length              = 0;
+    info.rip_rel_disp_offset = -1;
+
     const uint8_t* start = p;
     int operand_size_16 = 0;  /* set if a 66 prefix was consumed */
     int rex_w           = 0;  /* set if a REX byte with W bit was consumed */
@@ -165,22 +194,23 @@ static int mj_lde(const uint8_t* p)
     if (op == 0x0F) {
         /* Two-byte escape. We do not handle 0F 38 / 0F 3A in this scope. */
         op = *p++;
-        if (op == 0x38 || op == 0x3A) return 0;
+        if (op == 0x38 || op == 0x3A) return info;
         entry = mj_lde_op0F[op];
     } else {
         entry = mj_lde_op1[op];
     }
 
-    if (entry == MJ_LDE_UU) return 0;
+    if (entry == MJ_LDE_UU) return info;
 
     imm_size = entry & 0x0F;
 
     /* ----- 4. ModR/M, SIB, displacement ------------------------------- */
     if (entry & MJ_LDE_M) {
-        uint8_t modrm = *p++;
-        uint8_t mod   = (uint8_t)((modrm >> 6) & 3);
-        uint8_t reg   = (uint8_t)((modrm >> 3) & 7);
-        uint8_t rm    = (uint8_t)( modrm       & 7);
+        int     modrm_off = (int)(p - start);
+        uint8_t modrm     = *p++;
+        uint8_t mod       = (uint8_t)((modrm >> 6) & 3);
+        uint8_t reg       = (uint8_t)((modrm >> 3) & 7);
+        uint8_t rm        = (uint8_t)( modrm       & 7);
 
         /* Group 3 (F6/F7): the immediate only exists for /0 (TEST) and
          * /1. Both opcodes carry the MJ_LDE_G3 flag and the table base
@@ -201,8 +231,15 @@ static int mj_lde(const uint8_t* p)
 
             if (mod == 0) {
                 if (rm == 5) {
-                    /* RIP-relative disp32. */
+                    /* RIP-relative disp32. The disp32 immediately follows
+                     * the ModR/M byte, so its offset within the
+                     * instruction is modrm_off + 1. The fixup pass in
+                     * MJ_CreateSite uses this to relocate the disp32 so
+                     * the trampoline copy resolves to the same absolute
+                     * target as the original. Covers LEA/MOV [rip+d] and
+                     * FF 15 / FF 25 indirect call/jmp. */
                     disp = 4;
+                    info.rip_rel_disp_offset = modrm_off + 1;
                 } else if (has_sib) {
                     /* SIB byte present; if base==5 the displacement is
                      * disp32 (no base register).                         */
@@ -234,7 +271,15 @@ static int mj_lde(const uint8_t* p)
     }
     p += imm_size;
 
-    return (int)(p - start);
+    info.length = (int)(p - start);
+    return info;
+}
+
+/* Length-only wrapper, preserved for callers that don't care about
+ * RIP-relative disp tracking. */
+static int mj_lde(const uint8_t* p)
+{
+    return mj_lde_ex(p).length;
 }
 
 #undef MJ_LDE_M
