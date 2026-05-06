@@ -1613,10 +1613,19 @@ static void InstallCrashHandler(void)
 /* Called from LoadModsOnce after the loader lock has been released.
  * Creates the watchdog thread that periodically re-installs MjCrashFilter
  * if the game (or CLR, or any late-loaded DLL) displaces it.
- * Idempotent: guards against being called more than once. */
+ * Idempotent: guards against being called more than once.
+ *
+ * Disabled by default. Too much of a headache. */
+static const BOOL g_crashWatchdogEnabled = FALSE;
 static LONG g_watchdogStarted = 0;
 static void StartCrashWatchdog(void)
 {
+    if (!g_crashWatchdogEnabled) {
+        CLog("[crash] Watchdog disabled (g_crashWatchdogEnabled=FALSE). "
+             "SEH+VEH crash handlers remain active.");
+        return;
+    }
+
     if (InterlockedCompareExchange(&g_watchdogStarted, 1, 0) != 0) return;
 
     HANDLE hThread = CreateThread(NULL, 0, &CrashFilterWatchdog, NULL, 0, NULL);
