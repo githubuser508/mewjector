@@ -25,19 +25,25 @@ Or use `mewjector.h` (single header, no import lib needed):
 static MewjectorAPI mj;
 
 // In init:
-if (!MJ_Resolve(&mj)) return;  // not present or too old
+if (!MJ_Require("MyMod") || !MJ_Resolve(&mj)) return;  // not present or too old
 mj.InstallHook(...);
 ```
 
-`MJ_Resolve` returns 0 gracefully if version.dll is the real system DLL.
+`MJ_Require`/`MJ_Resolve` will check if Mewjector is present, log to the user if
+they need to update Mewjector, and retrieve all functions. They fail gracefully
+(return 0) if version.dll is the real system DLL.
 
 
 ## Versioning
 
-`MJ_GetVersion()` returns 3. The number increments when exports are added.
-Existing signatures never change. `MJ_Resolve()` gates on
-`MJ_GetVersion() >= MJ_API_VERSION`.
+`MJ_GetVersion` returns 3. The number increments when exports are added.
+Existing signatures never change.
 
+`MJ_Require`/`MJ_Resolve` gate on `MJ_GetVersion() >= MJ_API_VERSION`.
+
+`MJ_RequireVersion`/`MJ_ResolveVersion` are variants of `MJ_Require`/`MJ_Resolve`
+that accept an explicit API version number. They gate on `MJ_GetVersion() >= apiVersion`,
+where `apiVersion <= MJ_API_VERSION`.
 
 ---
 
