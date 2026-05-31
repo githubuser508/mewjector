@@ -85,36 +85,59 @@ static void LogClose(void)
     if (g_logMutex) { CloseHandle(g_logMutex); g_logMutex = NULL; }
 }
 
-static void CLog(const char* fmt, ...)
+/* Single low-level writer shared by CLog and the exported MJ_Log.  Writes a
+ * preformatted buffer via WriteFile on the raw Win32 handle, guarded by a
+ * 0ms try-lock on g_logMutex.  If the mutex is held (e.g. by a thread
+ * suspended mid-write) the data is written WITHOUT the lock rather than
+ * blocking — two concurrent unguarded writes may garble a line in extreme
+ * cases, but the process never deadlocks.  WriteFile bypasses the CRT
+ * FILE-stream lock entirely, so it succeeds even when a thread is frozen
+ * mid-fprintf holding that lock.  Routing both loggers through here ensures
+ * we never mix buffered stdio with raw writes on the same handle. */
+static void LogWriteRaw(const char* buf, int n)
 {
-    if (g_logHandle == INVALID_HANDLE_VALUE) return;
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char buf[1024];
-    int n = snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] ",
-                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    if (n > 0 && n < (int)sizeof(buf)) {
-        va_list ap;
-        va_start(ap, fmt);
-        int m = vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
-        va_end(ap);
-        if (m > 0) n += m;
-    }
-    if (n > 0 && n + 1 < (int)sizeof(buf))
-        buf[n++] = '\n';
-
-    /* Try-acquire the mutex (0ms timeout).  If it is held by a suspended
-     * thread, skip the wait and fall through to an unguarded WriteFile —
-     * two concurrent unguarded writes may produce a garbled log line in
-     * extreme cases, but the process will never deadlock.
-     * WriteFile bypasses the CRT FILE-stream lock entirely, so it succeeds
-     * even when a thread is frozen mid-fprintf holding that lock. */
+    if (g_logHandle == INVALID_HANDLE_VALUE || n <= 0) return;
     BOOL held = (g_logMutex &&
                  WaitForSingleObject(g_logMutex, 0) == WAIT_OBJECT_0);
     DWORD written;
     WriteFile(g_logHandle, buf, (DWORD)n, &written, NULL);
     if (held) ReleaseMutex(g_logMutex);
+}
+
+/* Formats "[hh:mm:ss.mmm] <prefix><msg>\n" into buf and returns its byte
+ * length.  The length is clamped to the buffer so an over-long message can
+ * never make LogWriteRaw read past the end of buf (vsnprintf returns the
+ * would-be length, not the truncated one).  prefix may be NULL. */
+static int LogFormat(char* buf, int cap, const char* prefix,
+                     const char* fmt, va_list ap)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    int n = snprintf(buf, cap, "[%02d:%02d:%02d.%03d] %s",
+                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                     prefix ? prefix : "");
+    if (n < 0) return 0;
+    if (n > cap - 1) n = cap - 1;          /* header alone filled the buffer */
+    if (n < cap - 1) {
+        int m = vsnprintf(buf + n, cap - n, fmt, ap);
+        if (m > 0) {
+            n += m;
+            if (n > cap - 1) n = cap - 1;  /* message truncated */
+        }
+    }
+    if (n < cap) buf[n++] = '\n';
+    return n;
+}
+
+static void CLog(const char* fmt, ...)
+{
+    if (g_logHandle == INVALID_HANDLE_VALUE) return;
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = LogFormat(buf, (int)sizeof(buf), NULL, fmt, ap);
+    va_end(ap);
+    LogWriteRaw(buf, n);
 }
 
 /* ===================================================================
@@ -383,12 +406,6 @@ static int      g_epFallbackStolenCount = 0;
  * Breaks if the game binary updates and the CS moves. */
 #define MJ_GAME_CRTCS_RVA  0x13A8268UL
 
-/* First CALL rel32 found in the stolen entry-point bytes, resolved to an
- * absolute function pointer.  In MSVC mainCRTStartup this is always
- * __security_init_cookie, which must run before any mod thread is created
- * (see EntryPointHandler).  NULL if no CALL was found in the prologue. */
-static void (__cdecl *g_epCrtInitFn)(void) = NULL;
-
 /* TLS slot used as a per-thread re-entrancy counter for MjVectoredFilter.
  * Win32 explicit TLS slots 0-63 are stored directly in the TEB (no heap
  * allocation), so TlsGetValue/TlsSetValue are safe to call from inside a
@@ -417,14 +434,6 @@ static void EntryPointHandler(void)
      * point and the fallback trampoline is just cleaning up. */
     CLog("[EP-fallback] Handler invoked (g_modsLoaded=%ld).",
          (long)g_modsLoaded);
-
-    /* __security_init_cookie was already called under the loader lock in
-     * PatchEntryPointFallback (see comment there for the full explanation).
-     * This call is now a no-op: __security_init_cookie returns immediately
-     * when the cookie is already set.  Kept as a safety net for the case
-     * where PatchEntryPointFallback found no CALL rel32 in the prologue. */
-    if (g_epCrtInitFn)
-        g_epCrtInitFn(); /* safety net: __security_init_cookie (already called under loader lock) */
 
     /* Spawn a deferred loader so this handler returns immediately and lets
      * mainCRTStartup initialise the game's CRT (especially the CS at
@@ -499,39 +508,6 @@ static int PatchEntryPointFallback(void)
     g_epFallbackAddr        = entryAddr;
     g_epFallbackStolenCount = stolenBytes;
     memcpy(g_epFallbackOrigBytes, entryAddr, stolenBytes);
-
-    /* Locate the first CALL rel32 (E8) in the stolen bytes and save its
-     * absolute target.  In MSVC mainCRTStartup this is always the call to
-     * __security_init_cookie, which must be invoked before mod DLLs are
-     * loaded (see EntryPointHandler for the full explanation). */
-    g_epCrtInitFn = NULL;
-    for (int i = 0; i + 4 < stolenBytes; i++) {
-        if (g_epFallbackOrigBytes[i] == 0xE8) {
-            int32_t rel32;
-            memcpy(&rel32, g_epFallbackOrigBytes + i + 1, 4);
-            /* Instruction is at entryAddr+i; next insn is entryAddr+i+5 */
-            g_epCrtInitFn = (void (__cdecl *)(void))
-                ((uint8_t*)entryAddr + i + 5 + rel32);
-            CLog("  Fallback: CALL at prologue+%d -> CRT init fn 0x%p",
-                 i, (void*)(UINT_PTR)g_epCrtInitFn);
-            /* Call immediately while still inside DllMain (loader lock held).
-             * The loader lock prevents background threads that run game code
-             * (e.g. TID 18900 observed in crash logs) from entering
-             * GS-protected game functions before __security_cookie is set.
-             * Race that caused the no-mods __fastfail crash:
-             *   - cookie init deferred to EntryPointHandler (~10 us after
-             *     lock release) → background thread enters GS-protected fn
-             *     with old placeholder cookie → epilogue check fails →
-             *     __report_gsfailure → __fastfail (invisible to VEH/SEH).
-             *   - cookie init here (under lock) → no background thread can
-             *     execute game code yet → no race. */
-            g_epCrtInitFn();
-            CLog("  Fallback: CRT init fn called under loader lock.");
-            break;
-        }
-    }
-    if (!g_epCrtInitFn)
-        CLog("  Fallback: no CALL rel32 in stolen bytes; CRT init pre-call skipped.");
 
     /* Trampoline: 20 (call wrapper) + 14 (jmp to entry start)
      * No stolen bytes -- the handler restores them before we jump back. */
@@ -1545,7 +1521,6 @@ static void CrashWriteMinidump(EXCEPTION_POINTERS* ep,
         if (g_logFile) {
             CLog("[crash] CreateThread for minidump helper failed: err=%lu",
                  (unsigned long)GetLastError());
-            fflush(g_logFile);
         }
         return;
     }
@@ -1556,7 +1531,6 @@ static void CrashWriteMinidump(EXCEPTION_POINTERS* ep,
     if (waitRes == WAIT_TIMEOUT) {
         if (g_logFile) {
             CLog("[crash] minidump helper timed out after 30s; abandoning");
-            fflush(g_logFile);
         }
         /* Do not kill the thread. It is holding dbghelp internal locks.
          * Leak the handle and let the OS clean up at process exit. */
@@ -1570,7 +1544,6 @@ static void CrashWriteMinidump(EXCEPTION_POINTERS* ep,
              (unsigned long)ctx.bytesWritten,
              (unsigned long)ctx.winErr,
              dumpPath);
-        fflush(g_logFile);
     }
 }
 
@@ -1626,7 +1599,6 @@ static BOOL WriteCrashReport(EXCEPTION_POINTERS* ep, const char* source)
             __try {
                 CLog("[crash] WriteCrashReport: CreateFileA failed GLE=%lu path=%s",
                      (unsigned long)GetLastError(), txtPath);
-                fflush(g_logFile);
             } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
     }
@@ -1635,10 +1607,10 @@ static BOOL WriteCrashReport(EXCEPTION_POINTERS* ep, const char* source)
      * fault on very broken processes. */
     __try { CrashWriteMinidump(ep, crashDir, stamp); } __except(EXCEPTION_EXECUTE_HANDLER) {}
 
-    /* Flush the normal chainloader log so whatever CLog output preceded
-     * the crash is on disk. Also log an audit entry so the chainloader
-     * log carries a breadcrumb. Useful when the crash report file itself
-     * fails to reach disk (bad path, locked handle, etc.). */
+    /* Log an audit entry so the chainloader log carries a breadcrumb.
+     * Useful when the crash report file itself fails to reach disk (bad
+     * path, locked handle, etc.).  CLog writes via WriteFile, so its bytes
+     * already reach the OS without a flush. */
     if (g_logFile) {
         __try {
             CLog("[crash] WriteCrashReport fired: source=%s code=0x%08lX @ %p -> %s",
@@ -1646,7 +1618,6 @@ static BOOL WriteCrashReport(EXCEPTION_POINTERS* ep, const char* source)
                  (unsigned long)ep->ExceptionRecord->ExceptionCode,
                  ep->ExceptionRecord->ExceptionAddress,
                  (hFile != INVALID_HANDLE_VALUE) ? txtPath : "(file write failed)");
-            fflush(g_logFile);
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
@@ -1662,7 +1633,6 @@ static LONG WINAPI MjCrashFilter(EXCEPTION_POINTERS* ep)
             CLog("[crash] MjCrashFilter: code=0x%08lX addr=%p",
                  (unsigned long)ep->ExceptionRecord->ExceptionCode,
                  ep->ExceptionRecord->ExceptionAddress);
-            fflush(g_logFile);
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
     WriteCrashReport(ep, "SEH-top-level");
@@ -1857,7 +1827,6 @@ static DWORD WINAPI CrashFilterWatchdog(LPVOID param)
         if ((tick % 5) == 0) {
             CLog("[crash] heartbeat: process alive at tick %llu",
                  (unsigned long long)tick);
-            if (g_logFile) fflush(g_logFile);
         }
     }
     /* Unreachable, but keep /W3 happy on older toolchains that don't
@@ -2615,24 +2584,21 @@ __declspec(dllexport) void __cdecl MJ_Log(
     const char* owner,
     const char* fmt, ...)
 {
-    if (!g_logFile) return;
-    WaitForSingleObject(g_logMutex, INFINITE);
+    if (g_logHandle == INVALID_HANDLE_VALUE) return;
 
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(g_logFile, "[%02d:%02d:%02d.%03d] [%s] ",
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-            owner ? owner : "?");
+    /* Build the "[owner] " tag, then share CLog's formatter + raw writer so
+     * mod log output never mixes buffered stdio with CLog's WriteFile on the
+     * same handle, and never blocks on g_logMutex (the old INFINITE wait could
+     * deadlock against a thread suspended mid-write). */
+    char prefix[128];
+    snprintf(prefix, sizeof(prefix), "[%s] ", owner ? owner : "?");
 
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_logFile, fmt, ap);
+    int n = LogFormat(buf, (int)sizeof(buf), prefix, fmt, ap);
     va_end(ap);
-
-    fprintf(g_logFile, "\n");
-    fflush(g_logFile);
-
-    ReleaseMutex(g_logMutex);
+    LogWriteRaw(buf, n);
 }
 
 /* ===================================================================
