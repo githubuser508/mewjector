@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <psapi.h>      /* EnumProcessModules, GetModuleInformation for the crash handler */
 #include <stdio.h>
+#include <io.h>      /* _fileno, _get_osfhandle for raw HANDLE logging */
 #include <string.h>
 #include "mj_lde.h"
 
@@ -50,8 +51,9 @@ static void ResolveBaseDir(void)
  *  Logging — writes to mod_logs/chainloader.log
  * =================================================================== */
 
-static FILE*  g_logFile  = NULL;
-static HANDLE g_logMutex = NULL;
+static FILE*  g_logFile   = NULL;
+static HANDLE g_logMutex  = NULL;
+static HANDLE g_logHandle = INVALID_HANDLE_VALUE; /* raw HANDLE for WriteFile; avoids CRT FILE-stream lock */
 
 static void LogOpen(void)
 {
@@ -65,33 +67,54 @@ static void LogOpen(void)
 
     g_logFile  = fopen(logPath, "w");
     g_logMutex = CreateMutexA(NULL, FALSE, NULL);
+    /* Cache the underlying Win32 HANDLE so CLog can use WriteFile directly,
+     * bypassing the CRT FILE-stream lock.  This prevents a deadlock when a
+     * background thread is suspended while it holds the FILE-stream lock. */
+    if (g_logFile)
+        g_logHandle = (HANDLE)(intptr_t)_get_osfhandle(_fileno(g_logFile));
 }
 
 static void LogClose(void)
 {
+    /* Clear g_logHandle BEFORE fclose so that CLog calls from other
+     * threads see INVALID_HANDLE_VALUE and bail out.  Do NOT CloseHandle
+     * it — the same kernel handle is owned by g_logFile and will be
+     * released by fclose. */
+    g_logHandle = INVALID_HANDLE_VALUE;
     if (g_logFile) { fclose(g_logFile); g_logFile = NULL; }
     if (g_logMutex) { CloseHandle(g_logMutex); g_logMutex = NULL; }
 }
 
 static void CLog(const char* fmt, ...)
 {
-    if (!g_logFile) return;
-    WaitForSingleObject(g_logMutex, INFINITE);
+    if (g_logHandle == INVALID_HANDLE_VALUE) return;
 
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(g_logFile, "[%02d:%02d:%02d.%03d] ",
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] ",
+                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    if (n > 0 && n < (int)sizeof(buf)) {
+        va_list ap;
+        va_start(ap, fmt);
+        int m = vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+        va_end(ap);
+        if (m > 0) n += m;
+    }
+    if (n > 0 && n + 1 < (int)sizeof(buf))
+        buf[n++] = '\n';
 
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(g_logFile, fmt, ap);
-    va_end(ap);
-
-    fprintf(g_logFile, "\n");
-    fflush(g_logFile);
-
-    ReleaseMutex(g_logMutex);
+    /* Try-acquire the mutex (0ms timeout).  If it is held by a suspended
+     * thread, skip the wait and fall through to an unguarded WriteFile —
+     * two concurrent unguarded writes may produce a garbled log line in
+     * extreme cases, but the process will never deadlock.
+     * WriteFile bypasses the CRT FILE-stream lock entirely, so it succeeds
+     * even when a thread is frozen mid-fprintf holding that lock. */
+    BOOL held = (g_logMutex &&
+                 WaitForSingleObject(g_logMutex, 0) == WAIT_OBJECT_0);
+    DWORD written;
+    WriteFile(g_logHandle, buf, (DWORD)n, &written, NULL);
+    if (held) ReleaseMutex(g_logMutex);
 }
 
 /* ===================================================================
@@ -301,7 +324,8 @@ static int  AlreadyLoaded(const char* fullPath);
 static void RecordLoaded(const char* fullPath);
 static int  g_loadedCount;
 
-static volatile LONG g_modsLoaded = 0;
+static volatile LONG g_modsLoaded  = 0;
+static HANDLE        g_modsLoadDone = NULL;  /* manual-reset event; signalled when LoadModsOnce completes */
 static void LoadModsOnce(void);   /* forward decl for entry-point fallback */
 static void StartCrashWatchdog(void);  /* forward decl; body in crash-handler block */
 
@@ -350,9 +374,73 @@ static uint8_t* g_epFallbackAddr       = NULL;
 static uint8_t  g_epFallbackOrigBytes[24];
 static int      g_epFallbackStolenCount = 0;
 
+/* Handles of threads suspended in EntryPointHandler to prevent the
+ * CRT-init race.  EpResumeWatcher resumes them after mainCRTStartup has
+ * had time to initialize the CRT (heap, critical sections, atexit). */
+/* Hardcoded RVA of the CRT critical section that TLS-callback threads
+ * try to acquire before mainCRTStartup initialises it.  Identified from
+ * VEH null-rgn diagnostics (RCX = game_base + 0x13A8268).
+ * Breaks if the game binary updates and the CS moves. */
+#define MJ_GAME_CRTCS_RVA  0x13A8268UL
+
+/* First CALL rel32 found in the stolen entry-point bytes, resolved to an
+ * absolute function pointer.  In MSVC mainCRTStartup this is always
+ * __security_init_cookie, which must run before any mod thread is created
+ * (see EntryPointHandler).  NULL if no CALL was found in the prologue. */
+static void (__cdecl *g_epCrtInitFn)(void) = NULL;
+
+/* TLS slot used as a per-thread re-entrancy counter for MjVectoredFilter.
+ * Win32 explicit TLS slots 0-63 are stored directly in the TEB (no heap
+ * allocation), so TlsGetValue/TlsSetValue are safe to call from inside a
+ * VEH or while handling a nested exception.  TLS_OUT_OF_INDEXES means the
+ * slot was not allocated (should never happen in practice). */
+static DWORD g_vehTlsSlot = TLS_OUT_OF_INDEXES;
+
+/* Calls LoadModsOnce() on a dedicated thread so EntryPointHandler can
+ * return immediately and let mainCRTStartup initialise the game's CRT
+ * (including the CS at game+MJ_GAME_CRTCS_RVA that TLS-callback threads
+ * spin on).  Without this, the full mod-load time (~40 ms) delays
+ * mainCRTStartup long enough for those threads to exhaust their 1 MB
+ * stacks -- each CS retry uses ~0x1100 bytes of stack, ~230 retries
+ * fill 1 MB. */
+static DWORD WINAPI EpDeferredLoader(LPVOID param)
+{
+    (void)param;
+    LoadModsOnce();
+    return 0;
+}
+
 static void EntryPointHandler(void)
 {
-    LoadModsOnce();
+    /* Log whether LoadModsOnce already ran via a proxy export.  If
+     * g_modsLoaded is non-zero here, a proxy call beat the entry
+     * point and the fallback trampoline is just cleaning up. */
+    CLog("[EP-fallback] Handler invoked (g_modsLoaded=%ld).",
+         (long)g_modsLoaded);
+
+    /* __security_init_cookie was already called under the loader lock in
+     * PatchEntryPointFallback (see comment there for the full explanation).
+     * This call is now a no-op: __security_init_cookie returns immediately
+     * when the cookie is already set.  Kept as a safety net for the case
+     * where PatchEntryPointFallback found no CALL rel32 in the prologue. */
+    if (g_epCrtInitFn)
+        g_epCrtInitFn(); /* safety net: __security_init_cookie (already called under loader lock) */
+
+    /* Spawn a deferred loader so this handler returns immediately and lets
+     * mainCRTStartup initialise the game's CRT (especially the CS at
+     * game+MJ_GAME_CRTCS_RVA).  Proxy calls that fire before loading is
+     * complete will block inside LoadModsOnce() on g_modsLoadDone. */
+    {
+        HANDLE hLoader = CreateThread(NULL, 0, EpDeferredLoader, NULL, 0, NULL);
+        if (hLoader) {
+            CloseHandle(hLoader);
+            CLog("[EP-fallback] Async mod-loader spawned.");
+        } else {
+            CLog("[EP-fallback] WARNING: CreateThread failed (err=%lu); "
+                 "loading mods synchronously.", GetLastError());
+            LoadModsOnce();
+        }
+    }
 
     /* Restore the original entry-point bytes so the jmp back executes
      * the real prologue in place -- no RIP-relative relocation needed. */
@@ -365,6 +453,7 @@ static void EntryPointHandler(void)
         VirtualProtect(g_epFallbackAddr, g_epFallbackStolenCount,
                        oldProt, &oldProt);
     }
+    CLog("[EP-fallback] Entry point restored; returning to trampoline.");
 }
 
 static int PatchEntryPointFallback(void)
@@ -410,6 +499,39 @@ static int PatchEntryPointFallback(void)
     g_epFallbackAddr        = entryAddr;
     g_epFallbackStolenCount = stolenBytes;
     memcpy(g_epFallbackOrigBytes, entryAddr, stolenBytes);
+
+    /* Locate the first CALL rel32 (E8) in the stolen bytes and save its
+     * absolute target.  In MSVC mainCRTStartup this is always the call to
+     * __security_init_cookie, which must be invoked before mod DLLs are
+     * loaded (see EntryPointHandler for the full explanation). */
+    g_epCrtInitFn = NULL;
+    for (int i = 0; i + 4 < stolenBytes; i++) {
+        if (g_epFallbackOrigBytes[i] == 0xE8) {
+            int32_t rel32;
+            memcpy(&rel32, g_epFallbackOrigBytes + i + 1, 4);
+            /* Instruction is at entryAddr+i; next insn is entryAddr+i+5 */
+            g_epCrtInitFn = (void (__cdecl *)(void))
+                ((uint8_t*)entryAddr + i + 5 + rel32);
+            CLog("  Fallback: CALL at prologue+%d -> CRT init fn 0x%p",
+                 i, (void*)(UINT_PTR)g_epCrtInitFn);
+            /* Call immediately while still inside DllMain (loader lock held).
+             * The loader lock prevents background threads that run game code
+             * (e.g. TID 18900 observed in crash logs) from entering
+             * GS-protected game functions before __security_cookie is set.
+             * Race that caused the no-mods __fastfail crash:
+             *   - cookie init deferred to EntryPointHandler (~10 us after
+             *     lock release) → background thread enters GS-protected fn
+             *     with old placeholder cookie → epilogue check fails →
+             *     __report_gsfailure → __fastfail (invisible to VEH/SEH).
+             *   - cookie init here (under lock) → no background thread can
+             *     execute game code yet → no race. */
+            g_epCrtInitFn();
+            CLog("  Fallback: CRT init fn called under loader lock.");
+            break;
+        }
+    }
+    if (!g_epCrtInitFn)
+        CLog("  Fallback: no CALL rel32 in stolen bytes; CRT init pre-call skipped.");
 
     /* Trampoline: 20 (call wrapper) + 14 (jmp to entry start)
      * No stolen bytes -- the handler restores them before we jump back. */
@@ -465,18 +587,28 @@ static int PatchEntryPointFallback(void)
 
     VirtualProtect(entryAddr, stolenBytes, oldProt, &oldProt);
 
-    CLog("  Fallback: entry point patched at RVA 0x%X (%d stolen bytes).",
-         entryRVA, stolenBytes);
+    CLog("  Fallback: entry point patched at RVA=0x%X stolen=%d trampoline=0x%p.",
+         entryRVA, stolenBytes, (void*)tramp);
 
     return 1;
 }
 
 static void LoadModsOnce(void)
 {
-    if (InterlockedCompareExchange(&g_modsLoaded, 1, 0) != 0) return;
+    if (InterlockedCompareExchange(&g_modsLoaded, 1, 0) != 0) {
+        /* Another thread won the race and is loading (or already done).
+         * Wait for the done event so proxy callers don't proceed before
+         * mods are fully initialised. */
+        if (g_modsLoadDone)
+            WaitForSingleObject(g_modsLoadDone, 15000);
+        return;
+    }
 
     /* Actually disable when Enabled=0 says we're disabled. */
-    if (!g_config.enabled) return;
+    if (!g_config.enabled) {
+        if (g_modsLoadDone) SetEvent(g_modsLoadDone);
+        return;
+    }
 
     /* Resolve game image base for RVA calculations */
     g_mjGameBase = (UINT_PTR)GetModuleHandleA(NULL);
@@ -585,6 +717,10 @@ static void LoadModsOnce(void)
             CLog("[MJ] WARNING: %d hook site(s) may have been "
                  "overwritten by non-Mewjector mods!", corrupted);
     }
+
+    /* Signal the done event so any thread waiting in LoadModsOnce()
+     * (e.g. a proxy call that fired while we were loading) can proceed. */
+    if (g_modsLoadDone) SetEvent(g_modsLoadDone);
 }
 
 
@@ -1026,6 +1162,9 @@ static void CrashWriteHookList(HANDLE hFile);
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prevUnhandledFilter = NULL;
 static PVOID                        g_vectoredHandlerReg  = NULL;
 static volatile LONG                g_crashHandlerEntered = 0;
+/* Caps the near-null AV extended-diagnostics block (registers + stack
+ * walk) to at most 8 dumps per run so it never floods the log. */
+static volatile LONG                g_nullAvDiagCount     = 0;
 
 /* MiniDumpWriteDump signature for dbghelp.dll, loaded dynamically. */
 typedef BOOL (WINAPI *PFN_MiniDumpWriteDump)(
@@ -1481,6 +1620,15 @@ static BOOL WriteCrashReport(EXCEPTION_POINTERS* ep, const char* source)
         __try { CrashWriteHookList (hFile); } __except(EXCEPTION_EXECUTE_HANDLER) {}
         CrashWriteStr(hFile, "=== end of crash report ===\r\n");
         CloseHandle(hFile);
+    } else {
+        /* Explain missing crash files in chainloader.log. */
+        if (g_logFile) {
+            __try {
+                CLog("[crash] WriteCrashReport: CreateFileA failed GLE=%lu path=%s",
+                     (unsigned long)GetLastError(), txtPath);
+                fflush(g_logFile);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
     }
 
     /* Minidump: separate __try because MiniDumpWriteDump can itself
@@ -1507,6 +1655,16 @@ static BOOL WriteCrashReport(EXCEPTION_POINTERS* ep, const char* source)
 
 static LONG WINAPI MjCrashFilter(EXCEPTION_POINTERS* ep)
 {
+    /* Log entry before WriteCrashReport so the breadcrumb survives even
+     * if the crash-file write itself fails (bad path, permissions, etc.). */
+    if (g_logFile) {
+        __try {
+            CLog("[crash] MjCrashFilter: code=0x%08lX addr=%p",
+                 (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                 ep->ExceptionRecord->ExceptionAddress);
+            fflush(g_logFile);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
     WriteCrashReport(ep, "SEH-top-level");
 
     /* Chain to the previous filter (WER, debugger, anything the game
@@ -1524,9 +1682,14 @@ static LONG WINAPI MjCrashFilter(EXCEPTION_POINTERS* ep)
 static LONG WINAPI MjVectoredFilter(EXCEPTION_POINTERS* ep)
 {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+
     DWORD code  = ep->ExceptionRecord->ExceptionCode;
     DWORD flags = ep->ExceptionRecord->ExceptionFlags;
 
+    /* Determine fatality BEFORE the re-entrancy check so that a fatal
+     * exception that fires while we are already inside CLog on this thread
+     * (guard==1) is never silently dropped -- it still gets a crash report,
+     * just without the log line (to avoid the recursive-AV chain). */
     BOOL fatal = FALSE;
     switch (code) {
         case EXCEPTION_STACK_OVERFLOW:      /* always fatal */
@@ -1538,14 +1701,127 @@ static LONG WINAPI MjVectoredFilter(EXCEPTION_POINTERS* ep)
             break;
     }
     /* A handler that declared itself non-continuable is by definition
-     * unrecoverable; write even if the code is otherwise routine. */
-    if (flags & EXCEPTION_NONCONTINUABLE) fatal = TRUE;
+     * unrecoverable -- EXCEPT for C++ EH exceptions (0xE06D7363): the MSVC
+     * runtime always sets EXCEPTION_NONCONTINUABLE on C++ throws to signal
+     * ownership of the dispatch frame, not that the process is dying.
+     * Steam (and other DLLs) throw and catch their own C++ exceptions
+     * internally; treating those as fatal produces spurious crash reports. */
+    if ((flags & EXCEPTION_NONCONTINUABLE) && code != 0xE06D7363) fatal = TRUE;
+
+    /* Re-entrancy guard: if CLog (or any other code below) causes an
+     * exception on this thread the VEH fires again.  Without this guard
+     * the chain MjVectoredFilter->CLog->AV->MjVectoredFilter->... unwinds
+     * the stack (STACK_OVERFLOW, 0xC00000FD).
+     * TlsGetValue/TlsSetValue are safe here: explicit TLS slots 0-63 live
+     * directly in the TEB and never allocate or throw.
+     * For NON-fatal re-entrant exceptions we return immediately (they are
+     * routine continuable AVs from ntdll TLS initialization).
+     * For FATAL re-entrant exceptions we skip the CLog but still write the
+     * crash report so the event is never silently discarded. */
+    BOOL reentrant = FALSE;
+    if (g_vehTlsSlot != TLS_OUT_OF_INDEXES) {
+        if ((ULONG_PTR)TlsGetValue(g_vehTlsSlot) != 0) {
+            reentrant = TRUE;
+            if (!fatal) return EXCEPTION_CONTINUE_SEARCH;
+            /* fatal + reentrant: fall through to WriteCrashReport, skip log */
+        } else {
+            TlsSetValue(g_vehTlsSlot, (PVOID)1);
+        }
+    }
+
+    /* Log every exception that isn't routine control-flow noise:
+     * guard-page probe (0x80000001), breakpoint (0x80000003),
+     * single-step (0x80000004).  C++ EH (0xE06D7363) is logged so
+     * unhandled C++ throws are visible, but they are never marked fatal.
+     * Skip logging when re-entrant to avoid the recursive-AV chain. */
+    if (!reentrant &&
+        code != 0x80000001 &&
+        code != 0x80000003 &&
+        code != 0x80000004) {
+        /* For access violations also log the access type (0=read 1=write 8=DEP)
+         * and the faulting VA -- distinguishes stack probes from real faults. */
+        if (code == EXCEPTION_ACCESS_VIOLATION &&
+            ep->ExceptionRecord->NumberParameters >= 2) {
+            CLog("[VEH] tid=%lu code=0x%08lX flags=0x%lX addr=%p type=%lu va=%p fatal=%d",
+                 (unsigned long)GetCurrentThreadId(),
+                 (unsigned long)code, (unsigned long)flags,
+                 ep->ExceptionRecord->ExceptionAddress,
+                 (unsigned long)ep->ExceptionRecord->ExceptionInformation[0],
+                 (void*)ep->ExceptionRecord->ExceptionInformation[1],
+                 (int)fatal);
+        } else {
+            CLog("[VEH] tid=%lu code=0x%08lX flags=0x%lX addr=%p fatal=%d",
+                 (unsigned long)GetCurrentThreadId(),
+                 (unsigned long)code, (unsigned long)flags,
+                 ep->ExceptionRecord->ExceptionAddress, (int)fatal);
+        }
+
+        /* Extended diagnostics for near-null-pointer AVs.
+         * va < 0x10000 is the signature of the CRT-init race: a background
+         * thread reads/writes through a CRT pointer that mainCRTStartup has
+         * not yet initialised.  Dump registers + fault-module + raw stack
+         * walk so the call chain is visible without a minidump.  Capped at
+         * g_nullAvDiagCount <= 8 to avoid flooding the log. */
+        if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->NumberParameters >= 2
+            && ep->ExceptionRecord->ExceptionInformation[1] < 0x10000
+            && ep->ContextRecord
+            && InterlockedIncrement(&g_nullAvDiagCount) <= 8) {
+            __try {
+                CONTEXT* ctx = ep->ContextRecord;
+                CLog("[VEH] null-rgn diag: RIP=%016llX RCX=%016llX RDX=%016llX",
+                     (unsigned long long)ctx->Rip,
+                     (unsigned long long)ctx->Rcx,
+                     (unsigned long long)ctx->Rdx);
+                CLog("[VEH] null-rgn diag: RAX=%016llX RSP=%016llX RBP=%016llX",
+                     (unsigned long long)ctx->Rax,
+                     (unsigned long long)ctx->Rsp,
+                     (unsigned long long)ctx->Rbp);
+                /* Resolve faulting instruction to module + RVA so we
+                 * know which system DLL (ucrtbase, ntdll, etc.) faulted. */
+                {
+                    char fmod[128]; UINT_PTR frva = 0;
+                    if (CrashResolveAddr(
+                            (UINT_PTR)ep->ExceptionRecord->ExceptionAddress,
+                            fmod, sizeof(fmod), &frva))
+                        CLog("[VEH] null-rgn diag: fault in %s+0x%IX",
+                             fmod, frva);
+                }
+                /* Raw stack walk: first 10 resolvable return addresses.
+                 * Map raw addresses to functions offline via IDA or WinDbg
+                 * if needed; module+RVA resolution is done here for
+                 * immediate readability. */
+                {
+                    UINT_PTR rsp = ctx->Rsp;
+                    char smod[128]; UINT_PTR srva = 0;
+                    int n = 0;
+                    for (int si = 0; si < 96 && n < 10; si++) {
+                        UINT_PTR val = *(UINT_PTR*)(rsp + (UINT_PTR)si * 8);
+                        if (val >= 0x10000 && val <= 0x7FFFFFFFFFFFULL
+                            && CrashResolveAddr(val, smod, sizeof(smod), &srva))
+                            CLog("[VEH] null-rgn stk[%02d] %s+0x%IX",
+                                 n++, smod, srva);
+                    }
+                    if (n == 0)
+                        CLog("[VEH] null-rgn diag: no resolvable frames in "
+                             "96-slot window");
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                CLog("[VEH] null-rgn diag: faulted while collecting "
+                     "diagnostics");
+            }
+        }
+    }
+
+    /* Release guard before WriteCrashReport so any exception inside it
+     * (DbgHelp, file I/O) can be logged normally rather than silently
+     * dropped as re-entrant. */
+    if (!reentrant && g_vehTlsSlot != TLS_OUT_OF_INDEXES)
+        TlsSetValue(g_vehTlsSlot, (PVOID)0);
 
     if (!fatal) return EXCEPTION_CONTINUE_SEARCH;
 
     WriteCrashReport(ep, "VEH-fatal");
-    /* Observer only: let the exception continue propagating so SEH and
-     * whatever else is in the chain gets to run. */
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -2437,12 +2713,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
 
+        /* Allocate VEH re-entrancy TLS slot before any handler is installed.
+         * Must happen before InstallCrashHandler() and before any thread is
+         * created, so the slot is valid whenever the VEH first fires. */
+        g_vehTlsSlot = TlsAlloc();
+
         ResolveBaseDir();
         LogOpen();
 
         /* Init Mewjector API mutexes (safe under loader lock) */
-        g_mjHookMutex = CreateMutexA(NULL, FALSE, NULL);
-        g_mjNameMutex = CreateMutexA(NULL, FALSE, NULL);
+        g_mjHookMutex  = CreateMutexA(NULL, FALSE, NULL);
+        g_mjNameMutex  = CreateMutexA(NULL, FALSE, NULL);
+        g_modsLoadDone = CreateEventA(NULL, TRUE, FALSE, NULL); /* manual-reset */
 
         /* Install the SEH+VEH crash handlers as early as possible so
          * any AV or __fastfail that fires during mod load (or during
@@ -2457,7 +2739,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
 #else
         CLog("=== Mewjector v3.0 ===");
 #endif
-        CLog("Process: PID %lu", GetCurrentProcessId());
+        CLog("Process: PID %lu  TID %lu", GetCurrentProcessId(), GetCurrentThreadId());
         CLog("Game directory: %s", g_baseDir);
         CLog("");
 
@@ -2491,6 +2773,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
     }
     else if (reason == DLL_PROCESS_DETACH) {
         CLog("=== Mewjector detaching ===");
+
+        if (g_vehTlsSlot != TLS_OUT_OF_INDEXES) {
+            TlsFree(g_vehTlsSlot);
+            g_vehTlsSlot = TLS_OUT_OF_INDEXES;
+        }
 
         if (g_mjHookMutex) { CloseHandle(g_mjHookMutex); g_mjHookMutex = NULL; }
         if (g_mjNameMutex) { CloseHandle(g_mjNameMutex); g_mjNameMutex = NULL; }
