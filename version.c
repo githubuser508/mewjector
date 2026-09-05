@@ -262,6 +262,34 @@ static void LoadConfig(void)
     }
 }
 
+static HMODULE LoadModLibrary(const char* fullPath)
+{
+    HMODULE hMod = LoadLibraryA(fullPath);
+
+    if (!hMod)
+        return NULL;
+
+    /*
+     * Native AOT DLLs cannot safely provide their own DllMain.
+     * Mewjector therefore supports an optional explicit initialization
+     * entry point instead.
+     *
+     * Existing native mods are unaffected: if MjInit is not exported,
+     * nothing happens here.
+     */
+    typedef void (__cdecl *MJ_ModInitFn)(void);
+
+    MJ_ModInitFn initFn =
+        (MJ_ModInitFn)GetProcAddress(hMod, "MjInit");
+
+    if (initFn) {
+        CLog("[MJ] Calling MjInit: %s", fullPath);
+        initFn();
+    }
+
+    return hMod;
+}
+
 /* ===================================================================
  *  Real version.dll forwarding
  * =================================================================== */
@@ -637,7 +665,7 @@ static void LoadModsOnce(void)
             }
 
             CLog("[LoadOrder]   %d. Loading: %s", i + 1, entry);
-            HMODULE hMod = LoadLibraryA(fullPath);
+            HMODULE hMod = LoadModLibrary(fullPath);
             if (hMod) {
                 CLog("[LoadOrder]      OK at 0x%p", (void*)hMod);
                 RecordLoaded(fullPath);
@@ -970,7 +998,7 @@ static void ScanAndLoadDir(const char* dirPath, const char* label)
 
         CLog("[%s]   Loading: %s", label, fd.cFileName);
 
-        HMODULE hMod = LoadLibraryA(fullPath);
+        HMODULE hMod = LoadModLibrary(fullPath);
         if (hMod) {
             CLog("[%s]     OK at 0x%p", label, (void*)hMod);
             RecordLoaded(fullPath);
@@ -1049,7 +1077,7 @@ static void LoadMewtatorManifest(const char* manifestPath)
 
         CLog("[Mewtator]   Loading: %s", line);
 
-        HMODULE hMod = LoadLibraryA(line);
+        HMODULE hMod = LoadModLibrary(line);
         if (hMod) {
             CLog("[Mewtator]     OK at 0x%p", (void*)hMod);
             RecordLoaded(line);
