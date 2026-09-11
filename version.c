@@ -7,7 +7,8 @@
  *   2. Reads chainloader.ini for configuration
  *   3. Scans configured directories for .dll mod files
  *   4. Optionally reads a Mewtator manifest for managed mod DLLs
- *   5. Logs everything to mod_logs/chainloader.log
+ *   5. Logs to mod_logs/chainloader.log unless Chainloader/Logging=0
+ *      (crash reports in mod_logs/crashes are separate)
  *
  * Build (MSVC):
  *   cl /LD /O2 /GS- version.c /Fe:version.dll /link /DEF:version.def
@@ -54,11 +55,15 @@ static void ResolveBaseDir(void)
 static FILE*  g_logFile   = NULL;
 static HANDLE g_logMutex  = NULL;
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE; /* raw HANDLE for WriteFile; avoids CRT FILE-stream lock */
+static int    g_logEnabled = 1;                   /* mirrors Chainloader/Logging */
 
 static void LogOpen(void)
 {
     char logDir[MAX_PATH];
     char logPath[MAX_PATH];
+
+    /* Logging=0 disables this log: no file, no output. */
+    if (!g_logEnabled) return;
 
     snprintf(logDir, MAX_PATH, "%smod_logs", g_baseDir);
     CreateDirectoryA(logDir, NULL);
@@ -67,9 +72,7 @@ static void LogOpen(void)
 
     g_logFile  = fopen(logPath, "w");
     g_logMutex = CreateMutexA(NULL, FALSE, NULL);
-    /* Cache the underlying Win32 HANDLE so CLog can use WriteFile directly,
-     * bypassing the CRT FILE-stream lock.  This prevents a deadlock when a
-     * background thread is suspended while it holds the FILE-stream lock. */
+    /* Cache the Win32 HANDLE so CLog can WriteFile without the stdio lock. */
     if (g_logFile)
         g_logHandle = (HANDLE)(intptr_t)_get_osfhandle(_fileno(g_logFile));
 }
@@ -85,18 +88,14 @@ static void LogClose(void)
     if (g_logMutex) { CloseHandle(g_logMutex); g_logMutex = NULL; }
 }
 
-/* Single low-level writer shared by CLog and the exported MJ_Log.  Writes a
- * preformatted buffer via WriteFile on the raw Win32 handle, guarded by a
- * 0ms try-lock on g_logMutex.  If the mutex is held (e.g. by a thread
- * suspended mid-write) the data is written WITHOUT the lock rather than
- * blocking — two concurrent unguarded writes may garble a line in extreme
- * cases, but the process never deadlocks.  WriteFile bypasses the CRT
- * FILE-stream lock entirely, so it succeeds even when a thread is frozen
- * mid-fprintf holding that lock.  Routing both loggers through here ensures
- * we never mix buffered stdio with raw writes on the same handle. */
+/* Low-level writer shared by CLog and MJ_Log: WriteFile on the raw handle,
+ * guarded by a 0ms try-lock on g_logMutex.  If the mutex is held (thread
+ * suspended mid-write) the write proceeds unlocked rather than blocking, so
+ * the process never deadlocks.  Bypasses the CRT FILE-stream lock entirely. */
 static void LogWriteRaw(const char* buf, int n)
 {
     if (g_logHandle == INVALID_HANDLE_VALUE || n <= 0) return;
+    if (!g_logEnabled) return;
     BOOL held = (g_logMutex &&
                  WaitForSingleObject(g_logMutex, 0) == WAIT_OBJECT_0);
     DWORD written;
@@ -149,6 +148,7 @@ static void CLog(const char* fmt, ...)
 typedef struct {
     int  enabled;            /* Master switch                            */
     int  logging;            /* Whether to log (already open by now)     */
+    int  epFallback;         /* Patch the PE entry point (default 1)     */
     char scanPath[MAX_PATH]; /* Directory to scan for DLLs (relative)    */
     int  scanGameDir;        /* Also scan the exe's own directory        */
     char manifest[MAX_PATH]; /* Mewtator manifest path (abs or relative) */
@@ -175,6 +175,25 @@ static void TrimInPlace(char* s)
         s[--len] = '\0';
 }
 
+/* Ini boolean: 1/y/Y true, other non-empty false, blank = default. */
+static int ParseBoolFlag(const char* value, int defaultWhenEmpty)
+{
+    if (!value[0]) return defaultWhenEmpty;
+    return value[0] == '1' || value[0] == 'y' || value[0] == 'Y';
+}
+
+/* Read Logging before the log opens; LoadConfig re-reads it. */
+static void ReadLoggingFlag(void)
+{
+    char iniPath[MAX_PATH];
+    char buf[64];
+    snprintf(iniPath, MAX_PATH, "%schainloader.ini", g_baseDir);
+    GetPrivateProfileStringA("Chainloader", "Logging", "1",
+                             buf, sizeof(buf), iniPath);
+    TrimInPlace(buf);
+    g_logEnabled = ParseBoolFlag(buf, 1);
+}
+
 static void LoadConfig(void)
 {
     char iniPath[MAX_PATH];
@@ -183,6 +202,7 @@ static void LoadConfig(void)
     /* Defaults — these apply if no ini exists */
     g_config.enabled        = 1;
     g_config.logging        = 1;
+    g_config.epFallback     = 1;
     g_config.scanGameDir    = 0;
     g_config.loadOrderCount = 0;
     strcpy(g_config.scanPath, "mods");
@@ -205,13 +225,20 @@ static void LoadConfig(void)
     GetPrivateProfileStringA("Chainloader", "Enabled", "1",
                              buf, sizeof(buf), iniPath);
     TrimInPlace(buf);
-    g_config.enabled = (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y');
+    g_config.enabled = ParseBoolFlag(buf, 1);
 
     /* Logging */
     GetPrivateProfileStringA("Chainloader", "Logging", "1",
                              buf, sizeof(buf), iniPath);
     TrimInPlace(buf);
-    g_config.logging = (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y');
+    g_config.logging = ParseBoolFlag(buf, 1);
+
+    /* EnableEPFallback */
+    GetPrivateProfileStringA("Chainloader", "EnableEPFallback", "1",
+                             buf, sizeof(buf), iniPath);
+    TrimInPlace(buf);
+    g_config.epFallback = ParseBoolFlag(buf, 1);
+    g_logEnabled     = g_config.logging;
 
     /* ScanPath */
     GetPrivateProfileStringA("Chainloader", "ScanPath", "mods",
@@ -223,7 +250,7 @@ static void LoadConfig(void)
     GetPrivateProfileStringA("Chainloader", "ScanGameDir", "0",
                              buf, sizeof(buf), iniPath);
     TrimInPlace(buf);
-    g_config.scanGameDir = (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y');
+    g_config.scanGameDir = ParseBoolFlag(buf, 0);
 
     /* MewtatorManifest */
     GetPrivateProfileStringA("Chainloader", "MewtatorManifest", "",
@@ -231,8 +258,8 @@ static void LoadConfig(void)
                              iniPath);
     TrimInPlace(g_config.manifest);
 
-    CLog("  Enabled=%d, Logging=%d, ScanPath=%s, ScanGameDir=%d",
-         g_config.enabled, g_config.logging,
+    CLog("  Enabled=%d, Logging=%d, EnableEPFallback=%d, ScanPath=%s, ScanGameDir=%d",
+         g_config.enabled, g_config.logging, g_config.epFallback,
          g_config.scanPath, g_config.scanGameDir);
     if (g_config.manifest[0])
         CLog("  MewtatorManifest=%s", g_config.manifest);
@@ -2685,6 +2712,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         g_vehTlsSlot = TlsAlloc();
 
         ResolveBaseDir();
+        ReadLoggingFlag();
         LogOpen();
 
         /* Init Mewjector API mutexes (safe under loader lock) */
@@ -2732,9 +2760,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
          * called yet, and the trampoline executes after the loader lock
          * is released.  If a proxy call fires first, the atomic guard
          * in LoadModsOnce() makes this a no-op. */
-        if (!PatchEntryPointFallback())
-            CLog("WARNING: entry-point fallback failed; mods depend on "
-                 "a version.dll proxy call.");
+        if (g_config.epFallback) {
+            if (!PatchEntryPointFallback())
+                CLog("WARNING: entry-point fallback failed; mods depend on "
+                     "a version.dll proxy call.");
+        } else {
+            CLog("WARNING: Entry-point fallback disabled; if the game never "
+                 "calls a version.dll export, no mods will be loaded.");
+        }
         CLog("");
     }
     else if (reason == DLL_PROCESS_DETACH) {
