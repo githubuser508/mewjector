@@ -155,6 +155,7 @@ typedef struct {
 
     /* [LoadOrder] — priority DLLs loaded first, in listed order */
     char loadOrder[MAX_LOAD_ORDER][MAX_PATH];
+    int  loadOrderKey[MAX_LOAD_ORDER];  /* ini ModN number per entry   */
     int  loadOrderCount;
 } ChainloaderConfig;
 
@@ -239,7 +240,13 @@ static void LoadConfig(void)
     else
         CLog("  MewtatorManifest=(none)");
 
-    /* [LoadOrder] — numbered entries: Mod1=foo.dll, Mod2=bar.dll, ... */
+    /* [LoadOrder] — numbered entries: Mod1=foo.dll, Mod2=bar.dll, ...
+     *
+     * The whole Mod1..ModN range is scanned rather than stopping at the
+     * first gap.  The shipped ini pins framework DLLs in the low numbers,
+     * and a user who comments one out must not lose every entry below it
+     * as a side effect.  The numbers set relative order and nothing else,
+     * so gaps are an expected state, not a malformed file. */
     g_config.loadOrderCount = 0;
     for (int i = 1; i <= MAX_LOAD_ORDER; i++) {
         char key[16];
@@ -247,16 +254,18 @@ static void LoadConfig(void)
         GetPrivateProfileStringA("LoadOrder", key, "",
                                  buf, sizeof(buf), iniPath);
         TrimInPlace(buf);
-        if (buf[0] == '\0') break;  /* Stop at first missing entry */
+        if (buf[0] == '\0') continue;  /* Unused slot, keep scanning */
         strncpy(g_config.loadOrder[g_config.loadOrderCount], buf, MAX_PATH - 1);
         g_config.loadOrder[g_config.loadOrderCount][MAX_PATH - 1] = '\0';
+        g_config.loadOrderKey[g_config.loadOrderCount] = i;
         g_config.loadOrderCount++;
     }
 
     if (g_config.loadOrderCount > 0) {
         CLog("  LoadOrder: %d entries", g_config.loadOrderCount);
         for (int i = 0; i < g_config.loadOrderCount; i++)
-            CLog("    Mod%d=%s", i + 1, g_config.loadOrder[i]);
+            CLog("    Mod%d=%s", g_config.loadOrderKey[i],
+                 g_config.loadOrder[i]);
     } else {
         CLog("  LoadOrder: (none)");
     }
@@ -345,6 +354,7 @@ static void ScanAndLoadDir(const char* dirPath, const char* label);
 static void LoadMewtatorManifest(const char* manifestPath);
 static int  AlreadyLoaded(const char* fullPath);
 static void RecordLoaded(const char* fullPath);
+static int  LoadedElsewhere(const char* fullPath, char* outPath, size_t outSize);
 static int  g_loadedCount;
 
 static volatile LONG g_modsLoaded  = 0;
@@ -602,7 +612,7 @@ static void LoadModsOnce(void)
 
     /* Phase 1: [LoadOrder] priority DLLs — loaded first, in listed order */
     if (g_config.loadOrderCount > 0) {
-        CLog("[LoadOrder] Loading %d priority DLL(s)...", g_config.loadOrderCount);
+        CLog("[LoadOrder] Processing %d entries...", g_config.loadOrderCount);
 
         /* Resolve the scan directory once for relative paths */
         char modDir[MAX_PATH];
@@ -619,8 +629,11 @@ static void LoadModsOnce(void)
             modDir[MAX_PATH - 1] = '\0';
         }
 
+        int loaded = 0, skipped = 0;
+
         for (int i = 0; i < g_config.loadOrderCount; i++) {
             const char* entry = g_config.loadOrder[i];
+            int         key   = g_config.loadOrderKey[i];
             char fullPath[MAX_PATH];
 
             /* Absolute or relative path */
@@ -632,20 +645,46 @@ static void LoadModsOnce(void)
             }
 
             if (AlreadyLoaded(fullPath)) {
-                CLog("[LoadOrder]   %d. SKIP (already loaded): %s", i + 1, entry);
+                CLog("[LoadOrder]   Mod%d SKIP (already loaded): %s", key, entry);
+                skipped++;
                 continue;
             }
 
-            CLog("[LoadOrder]   %d. Loading: %s", i + 1, entry);
+            /* A pinned entry the user does not have installed is an
+             * expected state, not a failure.  The shipped ini names the
+             * framework DLLs so they land ahead of anything that calls
+             * into them, and a given install will usually carry only
+             * some of them.  Testing before LoadLibraryA keeps the log
+             * honest: "not installed" instead of error 126, which reads
+             * like something broke.  A DLL that is present but refuses
+             * to load still reports the real error below. */
+            DWORD attr = GetFileAttributesA(fullPath);
+            if (attr == INVALID_FILE_ATTRIBUTES ||
+                (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                CLog("[LoadOrder]   Mod%d SKIP (not installed): %s", key, entry);
+                skipped++;
+                continue;
+            }
+
+            char other[MAX_PATH];
+            if (LoadedElsewhere(fullPath, other, sizeof(other))) {
+                CLog("[LoadOrder]   Mod%d SKIP (already loaded from %s)", key, other);
+                skipped++;
+                continue;
+            }
+
+            CLog("[LoadOrder]   Mod%d Loading: %s", key, entry);
             HMODULE hMod = LoadLibraryA(fullPath);
             if (hMod) {
                 CLog("[LoadOrder]      OK at 0x%p", (void*)hMod);
                 RecordLoaded(fullPath);
+                loaded++;
             } else {
                 DWORD err = GetLastError();
                 CLog("[LoadOrder]      FAILED — error %lu (0x%08lX)", err, err);
             }
         }
+        CLog("[LoadOrder]   Done: %d loaded, %d skipped", loaded, skipped);
         CLog("");
     }
 
@@ -926,6 +965,30 @@ static void RecordLoaded(const char* fullPath)
     }
 }
 
+/* The full-path table above cannot see the same mod arriving twice from
+ * two folders (mods\x.dll via [LoadOrder] or the scan, then
+ * <Mewtator>\X\x.dll via the manifest).  Windows would happily map both
+ * and the mod would run twice.  The loader itself keys modules on the
+ * file name, so ask it: if a module with this file name is already in
+ * the process, report where it was loaded from and let the caller skip.
+ * Any later copy is the same mod by definition; a mod that needs two
+ * instances of itself does not exist. */
+static int LoadedElsewhere(const char* fullPath, char* outPath, size_t outSize)
+{
+    const char* base  = strrchr(fullPath, '\\');
+    const char* base2 = strrchr(fullPath, '/');
+    if (base2 > base) base = base2;
+    base = base ? base + 1 : fullPath;
+
+    HMODULE h = GetModuleHandleA(base);
+    if (!h) return 0;
+
+    if (!GetModuleFileNameA(h, outPath, (DWORD)outSize))
+        strncpy(outPath, "(unknown path)", outSize - 1);
+    outPath[outSize - 1] = '\0';
+    return 1;
+}
+
 /* Scan a directory for .dll files and load them */
 static void ScanAndLoadDir(const char* dirPath, const char* label)
 {
@@ -964,6 +1027,13 @@ static void ScanAndLoadDir(const char* dirPath, const char* label)
 
         if (AlreadyLoaded(fullPath)) {
             CLog("[%s]   SKIP (already loaded): %s", label, fd.cFileName);
+            skipped++;
+            continue;
+        }
+
+        char other[MAX_PATH];
+        if (LoadedElsewhere(fullPath, other, sizeof(other))) {
+            CLog("[%s]   SKIP (already loaded from %s): %s", label, other, fd.cFileName);
             skipped++;
             continue;
         }
@@ -1043,6 +1113,13 @@ static void LoadMewtatorManifest(const char* manifestPath)
 
         if (AlreadyLoaded(line)) {
             CLog("[Mewtator]   SKIP (already loaded): %s", line);
+            skipped++;
+            continue;
+        }
+
+        char other[MAX_PATH];
+        if (LoadedElsewhere(line, other, sizeof(other))) {
+            CLog("[Mewtator]   SKIP (already loaded from %s): %s", other, line);
             skipped++;
             continue;
         }
@@ -2344,7 +2421,11 @@ static void MJ_RebuildChain(MJ_HookSite* site)
  *  outTrampoline receives a callable function pointer with the
  *  same signature as the hooked function.  Calling it invokes
  *  the next hook in the chain, or the original game function
- *  if this is the last (lowest-priority) hook.
+ *  if this is the last hook (the highest priority value).
+ *
+ *  Equal priorities keep install order.  A new hook is appended
+ *  after every entry that already shares its value, so whichever
+ *  mod loaded first also runs first within that tier.
  *
  *  Returns 1 on success, 0 on failure.
  * =================================================================== */

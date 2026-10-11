@@ -85,14 +85,17 @@ This produces `version.dll` along with intermediate build artifacts (`.obj`, `.e
 
 **DLL exclusion list:** Mewjector automatically skips known system/engine DLLs (Steam, DirectX, XInput, etc.) to avoid conflicts. See `g_excludeList` in `version.c` for the full list.
 
-**Load order:** DLLs are loaded in filesystem enumeration order within each phase:
-1. Configured `ScanPath` directory
-2. Game executable directory (if `ScanGameDir=1`)
-3. Mewtator manifest entries (if configured)
+**Load order:** DLLs are loaded in four phases:
+1. `[LoadOrder]` entries in `chainloader.ini`, in the order listed
+2. Configured `ScanPath` directory
+3. Game executable directory (if `ScanGameDir=1`)
+4. Mewtator manifest entries (if configured)
 
-DLLs already loaded in an earlier phase are skipped in later ones.
+Phase 1 is an explicit list, so put a DLL there when it has to load ahead of the rest (a shared library that later mods depend on, for example). Phases 2 and 3 load in filesystem enumeration order, which is alphabetical and therefore no help when a dependency sorts after its dependents. DLLs already loaded in an earlier phase are skipped in later ones, and so is any DLL that is already in the process under the same file name from another folder, so a mod that reaches the loader twice (from `mods/` and again through the Mewtator manifest, for example) runs once.
 
-**Thread safety:** Logging is mutex-protected. DLL loading happens synchronously during `DLL_PROCESS_ATTACH` before the game's main thread continues.
+`Mod1` through `Mod9` are reserved for framework DLLs and ship pre-configured in `chainloader.ini`: `Mod1` is held for Mewjector's own .NET bridge (coming with v4) and `Mod2` pins `csf_core.dll`. Start your own entries at `Mod10`. The numbers set relative order only, gaps are allowed, and an entry naming a DLL you don't have installed is skipped instead of reported as a failure. That way one shipped list works on installs that carry only part of the stack.
+
+**Thread safety:** Logging is mutex-protected. Mod DLLs are not loaded from `DllMain`, because the Windows loader lock is held there and would stop any thread a mod tries to start. Loading is deferred to the game's first call into a `version.dll` export and runs synchronously at that point. Builds that never call one fall back to a patched entry point.
 
 ## Compatibility
 
