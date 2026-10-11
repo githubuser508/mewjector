@@ -262,10 +262,15 @@ Returns 3.
 
 ```
 DllMain (loader lock held)
-  Base dir, log, mutexes, real version.dll, config
-  Mod loading deferred
+  Base dir, Wine detection, log, mutexes, crash handlers,
+  real version.dll, config
+  Mod loading deferred; game entry point patched (EnableEPFallback)
 
-First version.dll proxy call
+Whichever comes first:
+  a) the game's first call into a version.dll export, or
+  b) the entry-point trampoline, which spawns a loader thread and
+     returns so the game's CRT start-up continues (v3.4+)
+
   LoadModsOnce():
     g_mjGameBase resolved, API is live
     Phase 1: [LoadOrder] DLLs (mods can call MJ_* in DllMain)
@@ -277,6 +282,16 @@ First version.dll proxy call
 
 Mods load sequentially via `LoadLibraryA`. Each mod's DllMain can safely call
 any MJ_* function; previous mods' hooks and registrations are already complete.
+A DLL already in the process under the same file name is skipped in every phase.
+
+Since v3.4 path (b) loads mods on a background thread while the game's CRT and
+static init run on the main thread, so a mod's DllMain can see partially
+initialised game state. A proxy call that arrives mid-load blocks until loading
+finishes. Under Wine/Proton that thread can deadlock startup, so since v3.5 the
+fallback is off there by default; `EnableEPFallback=1` forces it on, `0` off.
+
+`Logging=0` writes no `chainloader.log` at all, `MJ_Log` included. Crash reports
+still go to `mod_logs/crashes/`.
 
 
 ---

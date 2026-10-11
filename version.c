@@ -7,7 +7,8 @@
  *   2. Reads chainloader.ini for configuration
  *   3. Scans configured directories for .dll mod files
  *   4. Optionally reads a Mewtator manifest for managed mod DLLs
- *   5. Logs everything to mod_logs/chainloader.log
+ *   5. Logs to mod_logs/chainloader.log unless Chainloader/Logging=0
+ *      (crash reports in mod_logs/crashes are separate)
  *
  * Build (MSVC):
  *   cl /LD /O2 /GS- version.c /Fe:version.dll /link /DEF:version.def
@@ -26,6 +27,9 @@
 
 /* Mewjector API version (used by LoadModsOnce and the API itself) */
 #define MJ_API_VERSION 3
+
+/* Release string printed in the log banner.  Bump with each release. */
+#define MJ_VERSION_STRING "3.5"
 
 /* Forward declarations and early globals for MJ API
  * (full API defined further below, but LoadModsOnce needs these) */
@@ -54,11 +58,15 @@ static void ResolveBaseDir(void)
 static FILE*  g_logFile   = NULL;
 static HANDLE g_logMutex  = NULL;
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE; /* raw HANDLE for WriteFile; avoids CRT FILE-stream lock */
+static int    g_logEnabled = 1;                   /* mirrors Chainloader/Logging */
 
 static void LogOpen(void)
 {
     char logDir[MAX_PATH];
     char logPath[MAX_PATH];
+
+    /* Logging=0 disables this log: no file, no output. */
+    if (!g_logEnabled) return;
 
     snprintf(logDir, MAX_PATH, "%smod_logs", g_baseDir);
     CreateDirectoryA(logDir, NULL);
@@ -67,9 +75,7 @@ static void LogOpen(void)
 
     g_logFile  = fopen(logPath, "w");
     g_logMutex = CreateMutexA(NULL, FALSE, NULL);
-    /* Cache the underlying Win32 HANDLE so CLog can use WriteFile directly,
-     * bypassing the CRT FILE-stream lock.  This prevents a deadlock when a
-     * background thread is suspended while it holds the FILE-stream lock. */
+    /* Cache the Win32 HANDLE so CLog can WriteFile without the stdio lock. */
     if (g_logFile)
         g_logHandle = (HANDLE)(intptr_t)_get_osfhandle(_fileno(g_logFile));
 }
@@ -85,18 +91,14 @@ static void LogClose(void)
     if (g_logMutex) { CloseHandle(g_logMutex); g_logMutex = NULL; }
 }
 
-/* Single low-level writer shared by CLog and the exported MJ_Log.  Writes a
- * preformatted buffer via WriteFile on the raw Win32 handle, guarded by a
- * 0ms try-lock on g_logMutex.  If the mutex is held (e.g. by a thread
- * suspended mid-write) the data is written WITHOUT the lock rather than
- * blocking — two concurrent unguarded writes may garble a line in extreme
- * cases, but the process never deadlocks.  WriteFile bypasses the CRT
- * FILE-stream lock entirely, so it succeeds even when a thread is frozen
- * mid-fprintf holding that lock.  Routing both loggers through here ensures
- * we never mix buffered stdio with raw writes on the same handle. */
+/* Low-level writer shared by CLog and MJ_Log: WriteFile on the raw handle,
+ * guarded by a 0ms try-lock on g_logMutex.  If the mutex is held (thread
+ * suspended mid-write) the write proceeds unlocked rather than blocking, so
+ * the process never deadlocks.  Bypasses the CRT FILE-stream lock entirely. */
 static void LogWriteRaw(const char* buf, int n)
 {
     if (g_logHandle == INVALID_HANDLE_VALUE || n <= 0) return;
+    if (!g_logEnabled) return;
     BOOL held = (g_logMutex &&
                  WaitForSingleObject(g_logMutex, 0) == WAIT_OBJECT_0);
     DWORD written;
@@ -149,6 +151,7 @@ static void CLog(const char* fmt, ...)
 typedef struct {
     int  enabled;            /* Master switch                            */
     int  logging;            /* Whether to log (already open by now)     */
+    int  epFallback;         /* Patch the PE entry point (default 1)     */
     char scanPath[MAX_PATH]; /* Directory to scan for DLLs (relative)    */
     int  scanGameDir;        /* Also scan the exe's own directory        */
     char manifest[MAX_PATH]; /* Mewtator manifest path (abs or relative) */
@@ -176,6 +179,44 @@ static void TrimInPlace(char* s)
         s[--len] = '\0';
 }
 
+/* Ini boolean: 1/y/Y true, other non-empty false, blank = default. */
+static int ParseBoolFlag(const char* value, int defaultWhenEmpty)
+{
+    if (!value[0]) return defaultWhenEmpty;
+    return value[0] == '1' || value[0] == 'y' || value[0] == 'Y';
+}
+
+/* Wine/Proton detection.  Wine's ntdll exports wine_get_version(); the
+ * real one does not.  Safe under the loader lock: ntdll is always mapped
+ * and GetProcAddress on it takes no lock we could deadlock on.  Used to
+ * pick the default for EnableEPFallback (see the fallback notes). */
+static int         g_underWine   = 0;
+static const char* g_wineVersion = "";
+
+static void DetectWine(void)
+{
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return;
+    const char* (__cdecl *getver)(void) =
+        (const char* (__cdecl *)(void))GetProcAddress(ntdll, "wine_get_version");
+    if (!getver) return;
+    g_underWine   = 1;
+    g_wineVersion = getver();
+    if (!g_wineVersion) g_wineVersion = "?";
+}
+
+/* Read Logging before the log opens; LoadConfig re-reads it. */
+static void ReadLoggingFlag(void)
+{
+    char iniPath[MAX_PATH];
+    char buf[64];
+    snprintf(iniPath, MAX_PATH, "%schainloader.ini", g_baseDir);
+    GetPrivateProfileStringA("Chainloader", "Logging", "1",
+                             buf, sizeof(buf), iniPath);
+    TrimInPlace(buf);
+    g_logEnabled = ParseBoolFlag(buf, 1);
+}
+
 static void LoadConfig(void)
 {
     char iniPath[MAX_PATH];
@@ -184,6 +225,7 @@ static void LoadConfig(void)
     /* Defaults — these apply if no ini exists */
     g_config.enabled        = 1;
     g_config.logging        = 1;
+    g_config.epFallback     = g_underWine ? 0 : 1;  /* see EnableEPFallback */
     g_config.scanGameDir    = 0;
     g_config.loadOrderCount = 0;
     strcpy(g_config.scanPath, "mods");
@@ -206,13 +248,23 @@ static void LoadConfig(void)
     GetPrivateProfileStringA("Chainloader", "Enabled", "1",
                              buf, sizeof(buf), iniPath);
     TrimInPlace(buf);
-    g_config.enabled = (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y');
+    g_config.enabled = ParseBoolFlag(buf, 1);
 
     /* Logging */
     GetPrivateProfileStringA("Chainloader", "Logging", "1",
                              buf, sizeof(buf), iniPath);
     TrimInPlace(buf);
-    g_config.logging = (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y');
+    g_config.logging = ParseBoolFlag(buf, 1);
+
+    /* EnableEPFallback.  Blank (the shipped value) means "auto": on under
+     * Windows, off under Wine/Proton, where the deferred loader thread the
+     * fallback spawns can deadlock the game's CRT start-up (issue #5).
+     * An explicit 0 or 1 always wins. */
+    GetPrivateProfileStringA("Chainloader", "EnableEPFallback", "",
+                             buf, sizeof(buf), iniPath);
+    TrimInPlace(buf);
+    g_config.epFallback = ParseBoolFlag(buf, g_underWine ? 0 : 1);
+    g_logEnabled     = g_config.logging;
 
     /* ScanPath */
     GetPrivateProfileStringA("Chainloader", "ScanPath", "mods",
@@ -224,7 +276,7 @@ static void LoadConfig(void)
     GetPrivateProfileStringA("Chainloader", "ScanGameDir", "0",
                              buf, sizeof(buf), iniPath);
     TrimInPlace(buf);
-    g_config.scanGameDir = (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y');
+    g_config.scanGameDir = ParseBoolFlag(buf, 0);
 
     /* MewtatorManifest */
     GetPrivateProfileStringA("Chainloader", "MewtatorManifest", "",
@@ -232,8 +284,8 @@ static void LoadConfig(void)
                              iniPath);
     TrimInPlace(g_config.manifest);
 
-    CLog("  Enabled=%d, Logging=%d, ScanPath=%s, ScanGameDir=%d",
-         g_config.enabled, g_config.logging,
+    CLog("  Enabled=%d, Logging=%d, EnableEPFallback=%d, ScanPath=%s, ScanGameDir=%d",
+         g_config.enabled, g_config.logging, g_config.epFallback,
          g_config.scanPath, g_config.scanGameDir);
     if (g_config.manifest[0])
         CLog("  MewtatorManifest=%s", g_config.manifest);
@@ -407,14 +459,26 @@ static uint8_t* g_epFallbackAddr       = NULL;
 static uint8_t  g_epFallbackOrigBytes[24];
 static int      g_epFallbackStolenCount = 0;
 
-/* Handles of threads suspended in EntryPointHandler to prevent the
- * CRT-init race.  EpResumeWatcher resumes them after mainCRTStartup has
- * had time to initialize the CRT (heap, critical sections, atexit). */
-/* Hardcoded RVA of the CRT critical section that TLS-callback threads
- * try to acquire before mainCRTStartup initialises it.  Identified from
- * VEH null-rgn diagnostics (RCX = game_base + 0x13A8268).
- * Breaks if the game binary updates and the CS moves. */
-#define MJ_GAME_CRTCS_RVA  0x13A8268UL
+/* The CRT-init race, for the record (2026-10, build 1.1.21239 with PDB):
+ *
+ * The trampoline runs at the PE entry point, before mainCRTStartup has
+ * initialised the game's CRT and static objects.  The deferred loader
+ * thread it spawns runs the game's TLS callbacks (the exe has two) before
+ * its own code, under the loader lock, and those callbacks enter a
+ * critical section that is still zeroed at that moment.  On Windows the
+ * fault is transient (the VEH logs it as a near-null AV in ntdll with
+ * RtlEnterCriticalSection on the stack) and the thread retries once the
+ * main thread has initialised the CS.  Under Wine the wait path on a
+ * zeroed CS blocks instead, with the loader lock held, and the main
+ * thread deadlocks in CRT init: no window, two threads in futex wait,
+ * about one launch in three.  Hence EnableEPFallback defaults to off
+ * when wine_get_version is exported (DetectWine).  The CS address moves
+ * with every game build, so nothing here depends on it any more.
+ *
+ * A build-independent fix that needs no thread at all is to trigger the
+ * fallback from an import the game calls from main (the exe imports
+ * SteamAPI_RestartAppIfNecessary and timeBeginPeriod), via the IAT.
+ * Not done yet. */
 
 /* TLS slot used as a per-thread re-entrancy counter for MjVectoredFilter.
  * Win32 explicit TLS slots 0-63 are stored directly in the TEB (no heap
@@ -424,12 +488,11 @@ static int      g_epFallbackStolenCount = 0;
 static DWORD g_vehTlsSlot = TLS_OUT_OF_INDEXES;
 
 /* Calls LoadModsOnce() on a dedicated thread so EntryPointHandler can
- * return immediately and let mainCRTStartup initialise the game's CRT
- * (including the CS at game+MJ_GAME_CRTCS_RVA that TLS-callback threads
- * spin on).  Without this, the full mod-load time (~40 ms) delays
- * mainCRTStartup long enough for those threads to exhaust their 1 MB
- * stacks -- each CS retry uses ~0x1100 bytes of stack, ~230 retries
- * fill 1 MB. */
+ * return immediately and let mainCRTStartup initialise the game's CRT.
+ * Loading synchronously here (v3.3 and earlier) delayed mainCRTStartup
+ * by ~40 ms, long enough for the game's early threads to exhaust their
+ * 1 MB stacks retrying a not-yet-initialised critical section (~0x1100
+ * bytes per retry).  See the CRT-init note above for the Wine side. */
 static DWORD WINAPI EpDeferredLoader(LPVOID param)
 {
     (void)param;
@@ -446,9 +509,9 @@ static void EntryPointHandler(void)
          (long)g_modsLoaded);
 
     /* Spawn a deferred loader so this handler returns immediately and lets
-     * mainCRTStartup initialise the game's CRT (especially the CS at
-     * game+MJ_GAME_CRTCS_RVA).  Proxy calls that fire before loading is
-     * complete will block inside LoadModsOnce() on g_modsLoadDone. */
+     * mainCRTStartup initialise the game's CRT.  Proxy calls that fire
+     * before loading is complete will block inside LoadModsOnce() on
+     * g_modsLoadDone. */
     {
         HANDLE hLoader = CreateThread(NULL, 0, EpDeferredLoader, NULL, 0, NULL);
         if (hLoader) {
@@ -1778,13 +1841,17 @@ static LONG WINAPI MjVectoredFilter(EXCEPTION_POINTERS* ep)
 
     /* Log every exception that isn't routine control-flow noise:
      * guard-page probe (0x80000001), breakpoint (0x80000003),
-     * single-step (0x80000004).  C++ EH (0xE06D7363) is logged so
-     * unhandled C++ throws are visible, but they are never marked fatal.
-     * Skip logging when re-entrant to avoid the recursive-AV chain. */
+     * single-step (0x80000004), and OutputDebugString, which Windows
+     * delivers as DBG_PRINTEXCEPTION_C (0x40010006) / _WIDE_C (0x4001000A)
+     * and the game emits by the hundred per launch.  C++ EH (0xE06D7363)
+     * is logged so unhandled C++ throws are visible, but never marked
+     * fatal.  Skip logging when re-entrant to avoid the recursive-AV chain. */
     if (!reentrant &&
         code != 0x80000001 &&
         code != 0x80000003 &&
-        code != 0x80000004) {
+        code != 0x80000004 &&
+        code != 0x40010006 &&
+        code != 0x4001000A) {
         /* For access violations also log the access type (0=read 1=write 8=DEP)
          * and the faulting VA -- distinguishes stack probes from real faults. */
         if (code == EXCEPTION_ACCESS_VIOLATION &&
@@ -2766,6 +2833,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         g_vehTlsSlot = TlsAlloc();
 
         ResolveBaseDir();
+        DetectWine();
+        ReadLoggingFlag();
         LogOpen();
 
         /* Init Mewjector API mutexes (safe under loader lock) */
@@ -2784,10 +2853,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         CLog("=== Mewjector DEBUGv3.x (build %s, RIP-rel-fixup-v2) ===",
              __DATE__);
 #else
-        CLog("=== Mewjector v3.0 ===");
+        CLog("=== Mewjector v%s (API v%d) ===", MJ_VERSION_STRING, MJ_API_VERSION);
 #endif
         CLog("Process: PID %lu  TID %lu", GetCurrentProcessId(), GetCurrentThreadId());
         CLog("Game directory: %s", g_baseDir);
+        if (g_underWine)
+            CLog("Wine %s detected: entry-point fallback off by default "
+                 "(EnableEPFallback=1 forces it).", g_wineVersion);
         CLog("");
 
         if (!LoadRealVersionDll()) {
@@ -2813,9 +2885,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
          * called yet, and the trampoline executes after the loader lock
          * is released.  If a proxy call fires first, the atomic guard
          * in LoadModsOnce() makes this a no-op. */
-        if (!PatchEntryPointFallback())
-            CLog("WARNING: entry-point fallback failed; mods depend on "
-                 "a version.dll proxy call.");
+        if (g_config.epFallback) {
+            if (!PatchEntryPointFallback())
+                CLog("WARNING: entry-point fallback failed; mods depend on "
+                     "a version.dll proxy call.");
+        } else {
+            CLog("Entry-point fallback off (%s); mods load on the first "
+                 "version.dll proxy call.",
+                 g_underWine ? "Wine default" : "EnableEPFallback=0");
+        }
         CLog("");
     }
     else if (reason == DLL_PROCESS_DETACH) {

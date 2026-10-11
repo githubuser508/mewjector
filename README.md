@@ -67,8 +67,12 @@ MewtatorManifest=
 ; Set to 0 to disable mod loading without removing Mewjector.
 Enabled=1
 
-; Write a log to mod_logs/chainloader.log.
+; Write a log to mod_logs/chainloader.log. 0 writes nothing at all.
 Logging=1
+
+; Patch the game's entry point so mods load even if the game never calls
+; a version.dll export. Blank = auto (on under Windows, off under Wine).
+EnableEPFallback=
 ```
 
 ## Building from Source
@@ -91,9 +95,9 @@ This produces `version.dll` along with intermediate build artifacts (`.obj`, `.e
 3. Game executable directory (if `ScanGameDir=1`)
 4. Mewtator manifest entries (if configured)
 
-Phase 1 is an explicit list, so put a DLL there when it has to load ahead of the rest (a shared library that later mods depend on, for example). Phases 2 and 3 load in filesystem enumeration order, which is alphabetical and therefore no help when a dependency sorts after its dependents. DLLs already loaded in an earlier phase are skipped in later ones, and so is any DLL that is already in the process under the same file name from another folder, so a mod that reaches the loader twice (from `mods/` and again through the Mewtator manifest, for example) runs once.
+Phase 1 is an explicit list, so put a DLL there when it has to load ahead of the rest (a shared library that later mods depend on, for example). Phases 2 and 3 load in filesystem enumeration order, which is alphabetical and therefore no help when a dependency sorts after its dependents. DLLs already loaded in an earlier phase are skipped in later ones, as is any DLL already loaded under the same file name from another folder (e.g. once from `mods/` and again through the Mewtator manifest).
 
-`Mod1` through `Mod9` are reserved for framework DLLs and ship pre-configured in `chainloader.ini`: `Mod1` is held for Mewjector's own .NET bridge (coming with v4) and `Mod2` pins `csf_core.dll`. Start your own entries at `Mod10`. The numbers set relative order only, gaps are allowed, and an entry naming a DLL you don't have installed is skipped instead of reported as a failure. That way one shipped list works on installs that carry only part of the stack.
+`Mod1` through `Mod9` are reserved for framework DLLs: `Mod1` is held for the .NET bridge (v4), `Mod2` pins `csf_core.dll`. Put your own entries at `Mod10` and up. The numbers only set relative order, gaps are fine, and a listed DLL you don't have installed is skipped, not an error.
 
 **Thread safety:** Logging is mutex-protected. Mod DLLs are not loaded from `DllMain`, because the Windows loader lock is held there and would stop any thread a mod tries to start. Loading is deferred to the game's first call into a `version.dll` export and runs synchronously at that point. Builds that never call one fall back to a patched entry point.
 
@@ -101,6 +105,18 @@ Phase 1 is an explicit list, so put a DLL there when it has to load ahead of the
 
 - Windows 10/11
 - Works alongside Steam
+
+## Troubleshooting
+
+Start with `mod_logs/chainloader.log`. It says what config was read, what loaded, what was skipped and why.
+
+No `mod_logs` folder at all means the game never loaded the proxy; Windows took `C:\Windows\System32\version.dll` instead. That's a trust policy or AV rejecting the unsigned DLL (Smart App Control, Exploit Protection, WDAC/AppLocker, or an AV whose driver stays on while "disabled"). Run [`tools/Mewjector-diagnose.ps1`](tools/Mewjector-diagnose.ps1) with the game at the menu, as admin if you can, and attach the output to your report:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\Mewjector-diagnose.ps1
+```
+
+Hangs on startup under Proton with no window: the entry-point fallback races the game's startup. v3.5+ turns it off under Wine automatically; on older versions set `EnableEPFallback=0`.
 
 ## Mewtator Integration
 
